@@ -499,7 +499,7 @@ logs/*.jsonl scan
 | SysGuard Monitor                                    |
 | eBPF Linux Runtime Security Monitor                 |
 +------------------------------------------------------+
-| [ Start Monitoring ] [ Stop ] [ Refresh Logs ]      |
+| [ Start Monitoring ] [ Stop ]					      |
 | Status: Stopped                                     |
 +------------------------------------------------------+
 | Log Sessions                                        |
