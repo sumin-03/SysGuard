@@ -1,0 +1,15 @@
+# Build artifacts
+/build/
+
+# Generated kernel type header (machine-specific, regenerate via `make vmlinux`)
+/bpf/vmlinux.h
+
+# Session logs and generated reports
+/logs/*.jsonl
+/logs/*.html
+
+# Editor / OS noise
+*.o
+*.swp
+.DS_Store
+/.claude/
