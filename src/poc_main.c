@@ -32,9 +32,9 @@ static const char *event_type_str(uint32_t type)
 static void print_event(const struct sysguard_event *e, void *ctx)
 {
     (void)ctx;
-    printf("[%-4s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s exe=%s\n",
+    printf("[%-4s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s exe=%s argv=[%s]\n",
            event_type_str(e->type), e->pid, e->ppid, e->uid,
-           e->comm, e->exe_path);
+           e->comm, e->exe_path, e->argv);
     fflush(stdout);
 }
 

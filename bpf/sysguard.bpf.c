@@ -14,6 +14,14 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// argv collection limits. Using a CONSTANT per-arg read size lets the BPF
+// verifier prove every write stays in bounds across the unrolled loop: after
+// i iterations the write offset is at most i * ARGV_ARG_SIZE, so as long as
+// ARGV_MAX_ARGS * ARGV_ARG_SIZE <= SYSGUARD_MAX_ARGV no write can overflow
+// e->argv. No runtime masking needed. Extra args / long args are truncated.
+#define ARGV_ARG_SIZE 32
+#define ARGV_MAX_ARGS 7   /* 7 * 32 = 224 <= 256 (SYSGUARD_MAX_ARGV) */
+
 // Ring buffer used to deliver events to user-space.
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -47,6 +55,39 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
     // For sys_enter_execve, args[0] is the user-space filename pointer.
     const char *filename = (const char *)ctx->args[0];
     bpf_probe_read_user_str(&e->exe_path, sizeof(e->exe_path), filename);
+
+    // args[1] is argv: a user-space array of user-space string pointers
+    // (char **). Collect up to ARGV_MAX_ARGS of them, space-separated, into
+    // e->argv. The unrolled loop plus a CONSTANT read size keeps the running
+    // offset provably bounded (off <= i * ARGV_ARG_SIZE), so the verifier
+    // accepts every write without runtime masking.
+    const char *const *argv = (const char *const *)ctx->args[1];
+    __u32 off = 0;
+
+#pragma unroll
+    for (int i = 0; i < ARGV_MAX_ARGS; i++) {
+        const char *arg = NULL;
+
+        // Pull the i-th user-space pointer out of the argv array.
+        if (bpf_probe_read_user(&arg, sizeof(arg), &argv[i]))
+            break;
+        if (!arg)
+            break;  // A NULL pointer marks the end of argv.
+
+        // Separate arguments with a single space (not before the first one).
+        if (i != 0)
+            e->argv[off++] = ' ';
+
+        // Copy the argument with a constant max size. The return value counts
+        // the NUL terminator, so advancing by n-1 lets the next separator
+        // overwrite that NUL and keep the string contiguous. The leftover
+        // bytes stay zero from the earlier memset, so e->argv is always
+        // NUL-terminated (off <= ARGV_MAX_ARGS * ARGV_ARG_SIZE < buffer).
+        long n = bpf_probe_read_user_str(&e->argv[off], ARGV_ARG_SIZE, arg);
+        if (n <= 0)
+            break;
+        off += n - 1;
+    }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
