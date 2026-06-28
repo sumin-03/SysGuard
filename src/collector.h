@@ -4,6 +4,11 @@
 #include <signal.h>
 #include "event.h"
 
+// Fake collector
+void fake_collector_run(const char *output_path);
+
+
+
 // Callback invoked once per decoded event delivered from the ring buffer.
 typedef void (*sysguard_event_cb)(const struct sysguard_event *e, void *ctx);
 
