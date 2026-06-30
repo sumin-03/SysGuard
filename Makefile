@@ -37,7 +37,7 @@ POC_SRC := \
 
 LIBS := -lbpf -lelf -lz
 
-.PHONY: all poc vmlinux run-poc clean
+.PHONY: all poc vmlinux run-poc sysguard run clean
 
 # Week 1 default: prove the eBPF program compiles and a skeleton is generated.
 all: $(BPF_SKEL)
@@ -68,10 +68,19 @@ $(POC_BIN): $(BPF_SKEL) $(POC_SRC) src/collector.h src/event.h
 run-poc: $(POC_BIN)
 	sudo ./$(POC_BIN)
 
-# Full binary (enabled once src/main.c, rules.c, fake_collector.c, jsonl_writer.c land).
-$(BIN): $(BPF_SKEL) $(USER_SRC)
+# Full SysGuard binary: A's eBPF collector wired into B's rules/JSONL/fake
+# modules. -DHAS_BPF_COLLECTOR enables the real eBPF path (main.c + the glue in
+# bpf_collector.c); without it main.c would fall back to the "eBPF unavailable"
+# error branch.
+sysguard: $(BIN)
+
+$(BIN): $(BPF_SKEL) $(USER_SRC) src/collector.h src/event.h
 	mkdir -p build
-	$(CC) $(CFLAGS) -I build -I src -o $(BIN) $(USER_SRC) $(LIBS)
+	$(CC) $(CFLAGS) -DHAS_BPF_COLLECTOR -I build -I src -o $(BIN) $(USER_SRC) $(LIBS)
+
+# Build and run the full binary in live eBPF mode (needs sudo for BPF load).
+run: $(BIN)
+	sudo ./$(BIN) --output sysguard.jsonl
 
 clean:
 	rm -rf build

@@ -13,3 +13,7 @@
 *.swp
 .DS_Store
 /.claude/
+build/
+sysguard.jsonl
+*.jsonl
+.vscode/
