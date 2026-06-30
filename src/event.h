@@ -1,19 +1,7 @@
 #ifndef SYSGUARD_EVENT_H
 #define SYSGUARD_EVENT_H
 
-// Under -target bpf, clang's freestanding stdint.h chains into glibc's
-// stdint.h, which assumes a real architecture triple (__x86_64__ etc.) that
-// the bpf pseudo-target does not define, breaking the include chain. Reuse
-// vmlinux.h's kernel-style fixed-width typedefs instead when building BPF.
-#ifdef __BPF__
-typedef __u8 uint8_t;
-typedef __u16 uint16_t;
-typedef __u32 uint32_t;
-typedef __u64 uint64_t;
-typedef __s32 int32_t;
-#else
 #include <stdint.h>
-#endif
 
 #define TASK_COMM_LEN 16
 #define SYSGUARD_MAX_PATH 256
@@ -24,9 +12,16 @@ typedef __s32 int32_t;
 enum sysguard_event_type {
     SYSGUARD_EVENT_EXEC = 1,
     SYSGUARD_EVENT_OPEN = 2,
+
+    // Optional event types for future extensions.
+    SYSGUARD_EVENT_UNLINK = 3,
+    SYSGUARD_EVENT_RENAME = 4,
+    SYSGUARD_EVENT_CHMOD = 5,
+    SYSGUARD_EVENT_CONNECT = 6,
+    SYSGUARD_EVENT_EXIT = 7,
 };
 
-// Normalized event consumed by the rule engine.
+// Normalized event consumed by the rule engine and session analyzer.
 struct sysguard_event {
     uint64_t timestamp_ns;
     uint32_t type;
@@ -41,9 +36,12 @@ struct sysguard_event {
     char exe_path[SYSGUARD_MAX_PATH];
     char argv[SYSGUARD_MAX_ARGV];
 
-    // Open event fields.
+    // File event fields.
     char path[SYSGUARD_MAX_PATH];
+    char old_path[SYSGUARD_MAX_PATH];
+    char new_path[SYSGUARD_MAX_PATH];
     int32_t flags;
+    int32_t mode;
 };
 
 #endif
