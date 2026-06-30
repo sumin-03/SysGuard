@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 // SysGuard eBPF collector.
 //
-// Week 1 PoC scope: attach to the execve syscall tracepoint and push a
-// normalized sysguard_event into a BPF ring buffer for the user-space engine.
-// openat collection and richer argv decoding land in later weeks.
+// Attaches to the execve and openat syscall tracepoints and pushes a normalized
+// sysguard_event into a BPF ring buffer for the user-space engine. execve
+// carries exe_path + argv; openat carries the target path + open(2) flags.
+// Collection only — no filtering or verdicts in kernel space; user-space picks
+// the target process and the rule engine decides what is suspicious.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
@@ -28,19 +30,13 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-int handle_execve(struct trace_event_raw_sys_enter *ctx)
+// Fill the caller-process context shared by every event type: timestamp, the
+// pid/ppid/uid triple, and comm. The event type and syscall-specific payload
+// are filled by each handler afterward. __always_inline keeps each tracepoint a
+// single flat program for the verifier (no real function call).
+static __always_inline void fill_process_context(struct sysguard_event *e)
 {
-    struct sysguard_event *e;
-
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
-        return 0;
-
-    __builtin_memset(e, 0, sizeof(*e));
-
     e->timestamp_ns = bpf_ktime_get_ns();
-    e->type = SYSGUARD_EVENT_EXEC;
 
     __u64 id = bpf_get_current_pid_tgid();
     e->pid = id >> 32;
@@ -51,6 +47,37 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
     e->uid = (__u32)bpf_get_current_uid_gid();
 
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+}
+
+// Zero the syscall-specific payload so fields a given handler does not fill
+// serialize as empty / 0. We deliberately avoid __builtin_memset over the whole
+// event: struct sysguard_event is >1KB, and the BPF backend lowers a memset
+// that large into an unsupported libcall. Clearing the first byte of each
+// string buffer is enough — every producer NUL-terminates what it writes and
+// every consumer reads these as C strings, so trailing bytes are never seen.
+static __always_inline void clear_payload(struct sysguard_event *e)
+{
+    e->exe_path[0] = '\0';
+    e->argv[0] = '\0';
+    e->path[0] = '\0';
+    e->old_path[0] = '\0';
+    e->new_path[0] = '\0';
+    e->flags = 0;
+    e->mode = 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int handle_execve(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_EXEC;
 
     // For sys_enter_execve, args[0] is the user-space filename pointer.
     const char *filename = (const char *)ctx->args[0];
@@ -80,14 +107,45 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
 
         // Copy the argument with a constant max size. The return value counts
         // the NUL terminator, so advancing by n-1 lets the next separator
-        // overwrite that NUL and keep the string contiguous. The leftover
-        // bytes stay zero from the earlier memset, so e->argv is always
-        // NUL-terminated (off <= ARGV_MAX_ARGS * ARGV_ARG_SIZE < buffer).
+        // overwrite that NUL and keep the string contiguous. Each read writes
+        // its own NUL terminator and clear_payload zeroed argv[0] for the
+        // no-args case, so e->argv is always NUL-terminated
+        // (off <= ARGV_MAX_ARGS * ARGV_ARG_SIZE < buffer).
         long n = bpf_probe_read_user_str(&e->argv[off], ARGV_ARG_SIZE, arg);
         if (n <= 0)
             break;
         off += n - 1;
     }
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// openat(int dfd, const char *filename, int flags, umode_t mode). We capture the
+// target path and the open flags; dfd-relative paths are recorded verbatim
+// (resolving them against the caller's CWD/dir-fd is a user-space concern).
+//
+// NOTE: openat fires for essentially every file access on the box (libraries,
+// configs, everything), so this is a high-volume stream. The MVP keeps kernel
+// space dumb and leaves target-process filtering and sensitive-path matching to
+// user-space (collector filter + rule engine), per the README design.
+SEC("tracepoint/syscalls/sys_enter_openat")
+int handle_openat(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_OPEN;
+
+    // args[1] is the user-space pathname pointer; args[2] is the open flags.
+    const char *filename = (const char *)ctx->args[1];
+    bpf_probe_read_user_str(&e->path, sizeof(e->path), filename);
+    e->flags = (int32_t)ctx->args[2];
 
     bpf_ringbuf_submit(e, 0);
     return 0;

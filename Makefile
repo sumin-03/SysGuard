@@ -28,12 +28,14 @@ USER_SRC := \
 	src/rules.c \
 	src/fake_collector.c \
 	src/jsonl_writer.c \
-	src/bpf_collector.c
+	src/bpf_collector.c \
+	src/target_filter.c
 
 # Standalone Week-1 collector PoC sources (owner A only).
 POC_SRC := \
 	src/bpf_collector.c \
-	src/poc_main.c
+	src/poc_main.c \
+	src/target_filter.c
 
 LIBS := -lbpf -lelf -lz
 
@@ -61,7 +63,7 @@ $(BPF_SKEL): $(BPF_OBJ)
 # Week-1 standalone collector PoC (no dependency on B's modules).
 poc: $(POC_BIN)
 
-$(POC_BIN): $(BPF_SKEL) $(POC_SRC) src/collector.h src/event.h
+$(POC_BIN): $(BPF_SKEL) $(POC_SRC) src/collector.h src/event.h src/target_filter.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -I build -I src -o $(POC_BIN) $(POC_SRC) $(LIBS)
 
@@ -74,7 +76,7 @@ run-poc: $(POC_BIN)
 # error branch.
 sysguard: $(BIN)
 
-$(BIN): $(BPF_SKEL) $(USER_SRC) src/collector.h src/event.h
+$(BIN): $(BPF_SKEL) $(USER_SRC) src/collector.h src/event.h src/target_filter.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -DHAS_BPF_COLLECTOR -I build -I src -o $(BIN) $(USER_SRC) $(LIBS)
 

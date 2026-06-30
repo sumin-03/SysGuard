@@ -21,9 +21,22 @@ typedef __s32 int32_t;
 
 // Event types shared by eBPF and user-space code.
 // Keep these values synchronized with bpf/sysguard.bpf.c.
+//
+// EXEC and OPEN are the MVP-required types and the only ones the collector
+// emits today. The remaining values are reserved for optional syscalls that
+// land only after execve/openat are stable (see README "Optional Syscall
+// 확장 우선순위"). Reserving the enum now keeps the wire contract stable so
+// adding a syscall later does not renumber existing events.
 enum sysguard_event_type {
     SYSGUARD_EVENT_EXEC = 1,
     SYSGUARD_EVENT_OPEN = 2,
+
+    // Optional events. Implement only when the MVP is stable.
+    SYSGUARD_EVENT_UNLINK = 3,  // unlinkat / unlink — file deletion (path).
+    SYSGUARD_EVENT_RENAME = 4,  // renameat / renameat2 — old_path + new_path.
+    SYSGUARD_EVENT_CHMOD = 5,   // fchmodat / chmod — path + mode.
+    SYSGUARD_EVENT_CONNECT = 6, // connect — network fields are Future Work.
+    SYSGUARD_EVENT_EXIT = 7,    // exit_group — process/session end marker.
 };
 
 // Normalized event consumed by the rule engine.
@@ -59,10 +72,15 @@ struct sysguard_event {
                                       // token is argv[0]. See bpf collector for
                                       // per-arg / arg-count limits.
 
-    // Open event fields (valid when type == SYSGUARD_EVENT_OPEN; not yet
-    // emitted by the collector — openat tracepoint is a later milestone).
-    char path[SYSGUARD_MAX_PATH];     // File path passed to openat.
-    int32_t flags;                    // open(2) flags.
+    // File event fields. openat (the implemented OPEN type) populates
+    // path + flags. The optional file syscalls reuse these: UNLINK/CHMOD use
+    // path; RENAME uses old_path + new_path. Unused fields stay zeroed.
+    char path[SYSGUARD_MAX_PATH];     // Primary file path (openat target,
+                                      // unlink target, chmod target).
+    char old_path[SYSGUARD_MAX_PATH]; // Rename source (SYSGUARD_EVENT_RENAME).
+    char new_path[SYSGUARD_MAX_PATH]; // Rename dest (SYSGUARD_EVENT_RENAME).
+    int32_t flags;                    // open(2) flags (SYSGUARD_EVENT_OPEN).
+    int32_t mode;                     // chmod mode bits (SYSGUARD_EVENT_CHMOD).
 };
 
 #endif

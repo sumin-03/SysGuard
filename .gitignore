@@ -8,6 +8,10 @@
 /logs/*.jsonl
 /logs/*.html
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # Editor / OS noise
 *.o
 *.swp
