@@ -2,10 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #include "collector.h"
 #include "target_filter.h"
 
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -94,8 +95,14 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    /* Generate session_id */
+    char session_id[64];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    strftime(session_id, sizeof(session_id), "session_%Y%m%d_%H%M%S", tm);
+
     printf("========================================\n");
-    printf("  SysGuard — eBPF Security Monitor\n");
+    printf("  SysGuard - AI Agent Boundary Auditor\n");
     printf("========================================\n");
     printf("  Mode    : %s\n", fake ? "FAKE (demo)" : "eBPF (live)");
     printf("  Output  : %s\n", output);
@@ -107,7 +114,7 @@ int main(int argc, char **argv) {
     printf("========================================\n\n");
 
     if (fake) {
-        fake_collector_run(output);
+        fake_collector_run(output, session_id, project_path, target_comm);
     } else {
 #ifdef HAS_BPF_COLLECTOR
         // Scope live collection to the target's process subtree. With no target
@@ -129,13 +136,12 @@ int main(int argc, char **argv) {
         target_filter_free(filter);
 #else
         fprintf(stderr,
-            "[ERROR] Real eBPF mode is not available in this build.\n"
-            "        This binary was compiled without libbpf/skeleton.\n"
-            "        Use --fake for testing, or build with A's bpf_collector.\n");
+            "[ERROR] Real eBPF mode not available in this build.\n"
+            "        Use --fake for testing.\n");
         return 1;
 #endif
     }
 
-    printf("\n[SysGuard] Session complete. Log saved to: %s\n", output);
+    printf("\n[SysGuard] Session complete. Log: %s\n", output);
     return 0;
 }
