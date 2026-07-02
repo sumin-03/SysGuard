@@ -22,6 +22,32 @@ DANGEROUS_COMMANDS = [
 
 TARGET_PROCESSES = ["claude", "codex", "gemini", "cursor", "code"]
 
+# Read-only system locations every process touches at startup (loader, libs,
+# locale, terminfo, /proc self-inspection). Not meaningful boundary signals —
+# without this allowlist every session is judged UNSAFE. Genuinely sensitive
+# system files (/etc/shadow, /etc/sudoers, ~/.ssh, ...) are still caught by
+# the PROTECTED_PATHS check, which runs before the boundary check.
+SYSTEM_PATH_PREFIXES = [
+    "/usr/", "/lib/", "/lib64/", "/opt/",
+    "/proc/", "/sys/", "/dev/", "/run/",
+    "/etc/ld.so", "/etc/locale", "/etc/nsswitch.conf",
+    "/etc/passwd", "/etc/group", "/etc/localtime",
+    "/etc/gitconfig", "/etc/gitattributes",
+    "/etc/terminfo", "/etc/inputrc", "/etc/bash",
+]
+
+# Benign per-user config that tools read on every invocation (git global
+# config, etc.). Matched against the path after stripping the home directory.
+USER_CONFIG_SUFFIXES = [
+    "/.gitconfig", "/.config/git/",
+]
+
+
+def is_system_path(path: str) -> bool:
+    if any(path.startswith(p) for p in SYSTEM_PATH_PREFIXES):
+        return True
+    return any(s in path for s in USER_CONFIG_SUFFIXES)
+
 
 def is_protected_path(path: str) -> bool:
     if not path:
@@ -54,6 +80,8 @@ def is_inside_project(path: str, project_path: str) -> bool:
 
 def is_boundary_violation(path: str, project_path: str) -> bool:
     if not path or not project_path or project_path == ".":
+        return False
+    if is_system_path(path):
         return False
     return not is_inside_project(path, project_path)
 

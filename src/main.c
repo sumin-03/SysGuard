@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     printf("========================================\n\n");
 
     if (fake) {
-        fake_collector_run(output, session_id, project_path, target_comm);
+        fake_collector_run(output, session.session_id, project_path, target_comm);
     } else {
 #ifdef HAS_BPF_COLLECTOR
         // Scope live collection to the target's process subtree. With no target

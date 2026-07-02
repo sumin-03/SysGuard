@@ -12,6 +12,10 @@
 __pycache__/
 *.pyc
 
+# Demo simulator sandboxes (runtime artifacts)
+/demo/sandbox_normal/
+/demo/sandbox_risky/
+
 # Editor / OS noise
 *.o
 *.swp

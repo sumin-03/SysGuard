@@ -1,43 +1,83 @@
 # SysGuard
 
-**eBPF/libbpf 기반 Linux Process-Specific Syscall Monitoring + AI Agent Session Profiling + GUI Report Viewer**
+**eBPF/libbpf 기반 AI Agent Boundary Auditor + Commit Safety Monitor**
 
-SysGuard는 Linux kernel의 주요 syscall event를 eBPF로 수집하고, user-space engine에서 특정 process와 child process의 활동을 session 단위로 분석하는 경량 runtime security monitor이다.
+SysGuard는 Linux kernel의 주요 syscall event를 eBPF로 수집하고, user-space에서 Claude Code, Codex, Gemini CLI 같은 AI 개발 에이전트의 작업 세션을 분석하는 경량 보안 모니터링 도구이다.
 
-기존 SysGuard의 핵심은 `execve`, `openat` syscall event를 수집해 의심 명령 실행과 민감 파일 접근을 탐지하는 것이다. 확장된 SysGuard는 여기서 한 단계 더 나아가 Codex, Claude Code, Gemini CLI 같은 AI 개발 에이전트가 로컬 시스템에서 어떤 명령을 실행하고 어떤 파일에 접근했는지를 session report로 요약한다.
+SysGuard의 목적은 단순히 syscall log를 보여주는 것이 아니다. Git이 추적하는 레포지토리 내부 변경은 Git이 잘 처리한다. SysGuard는 Git이 보기 어려운 **로컬 시스템 행위**, 즉 AI Agent가 프로젝트 경계를 벗어나 `.env`, SSH key, 시스템 파일, 외부 명령, 파괴적 Git 명령 등에 접근했는지를 판단한다.
 
-중요한 설계 원칙은 다음과 같다.
+핵심 질문은 다음이다.
 
 ```text
-eBPF는 시스템 전체에서 발생하는 주요 syscall event를 가볍게 수집한다.
-User-space engine은 target process와 child process에 해당하는 event만 필터링한다.
-Session analyzer는 필터링된 event를 시간 순서와 process tree 기준으로 묶어 report를 생성한다.
+이 AI Agent 작업은 commit해도 안전한가?
+AI Agent가 허용된 개발 작업 범위를 벗어났는가?
+Git이 추적하지 못하는 로컬 보안 리스크가 있었는가?
 ```
 
-공모전 시연에서는 사용자가 직접 조작할 수 있는 GUI를 제공한다. GUI에서 monitoring을 Start/Stop하고, 수집된 log session 목록을 확인하며, 선택한 log를 HTML report로 열람할 수 있다.
+공모전 시연에서는 Python GUI를 통해 monitoring을 Start/Stop하고, 선택한 session log를 HTML 기반 **Commit Safety Report**로 확인한다.
 
 ---
 
-## 1. 완성품 형태
+## 1. 프로젝트 정의
 
-SysGuard는 내부적으로 세 부분으로 나뉜다.
+### 기존 Linux syscall monitor와의 차이
+
+일반적인 syscall monitor는 다음 정보를 제공한다.
+
+```text
+어떤 프로세스가 어떤 syscall을 호출했는가?
+```
+
+SysGuard는 다음 정보를 제공하는 것을 목표로 한다.
+
+```text
+AI Agent가 개발 작업 중 허용된 project boundary를 벗어났는가?
+민감 파일이나 시스템 자원에 접근했는가?
+파괴적 명령이나 위험한 Git 명령을 실행했는가?
+현재 작업 결과를 commit해도 안전한가?
+```
+
+### 핵심 컨셉
+
+```text
+Git:
+- 레포지토리 내부 파일 변경 추적
+- diff 확인
+- branch/commit 기반 복구
+
+SysGuard:
+- AI Agent의 syscall event 추적
+- project boundary 위반 감지
+- protected path 접근 감지
+- dangerous command 실행 감지
+- Commit Safety Report 생성
+```
+
+즉, SysGuard는 Git을 대체하지 않는다. Git이 다루지 않는 로컬 시스템 보안 영역을 보완한다.
+
+---
+
+## 2. 완성품 형태
 
 ```text
 SysGuard Monitor App
 ├── Python GUI wrapper
+│   ├── Project Path input
+│   ├── Target Process input
 │   ├── Start Monitoring button
 │   ├── Stop button
 │   ├── Refresh Logs button
 │   ├── Log session list
-│   ├── Open HTML Report button
-│   └── Agent Session Summary view
+│   └── Open Commit Safety Report button
 │
-├── User-space analysis layer
+├── Python analysis/report layer
 │   ├── JSONL event reader
-│   ├── target process filter
-│   ├── process tree tracker
-│   ├── AI agent session analyzer
-│   ├── risk score calculator
+│   ├── lightweight target/child process filter
+│   ├── project boundary checker
+│   ├── protected path policy checker
+│   ├── dangerous command detector
+│   ├── git status/diff summary collector
+│   ├── commit safety evaluator
 │   └── HTML report generator
 │
 └── C/eBPF monitoring engine
@@ -50,33 +90,32 @@ SysGuard Monitor App
     └── JSONL log writer
 ```
 
-핵심 원칙은 다음과 같다.
+핵심 원칙:
 
 ```text
 GUI는 eBPF를 직접 다루지 않는다.
 GUI는 C/eBPF engine을 실행/종료하고, 생성된 JSONL log를 HTML report로 보여준다.
-AI agent profiling은 kernel space가 아니라 user-space 분석 계층에서 수행한다.
+eBPF는 판단하지 않고 event 수집에 집중한다.
+AI Agent 분석, boundary 판단, commit safety 평가는 user-space에서 수행한다.
 ```
 
 ---
 
-## 2. 프로젝트 목표
+## 3. 프로젝트 목표
 
 ### 핵심 목표
 
 - Linux process execution event 수집
 - Linux file access event 수집
-- 특정 process의 syscall activity 모니터링
-- target process와 child process의 event filtering
-- AI agent session profiling
-- 의심 명령 실행 탐지
-- 민감 파일 접근 탐지
-- AI agent의 민감 파일 접근 탐지
-- CLI alert 출력
-- JSONL session log 생성
+- 특정 process와 child process의 syscall activity를 lightweight하게 추적
+- Claude Code / Codex / Gemini CLI 같은 AI Agent session 분석
+- project path 내부/외부 접근 분류
+- `.env`, `.ssh`, `/etc/shadow` 등 protected path 접근 탐지
+- `rm -rf`, `git reset --hard`, `chmod 777` 등 dangerous command 탐지
+- Git diff와 syscall event를 함께 요약
+- Commit Safety를 `SAFE`, `REVIEW_NEEDED`, `UNSAFE`로 판단
 - GUI 기반 Start/Stop 제어
-- GUI 기반 log session 목록 조회
-- 선택한 log를 HTML report로 변환 및 표시
+- HTML 기반 Commit Safety Report 생성
 - harmless demo script 기반 재현 가능한 시연
 
 ### MVP 범위
@@ -91,41 +130,102 @@ AI agent profiling은 kernel space가 아니라 user-space 분석 계층에서 �
 | event 전달 | BPF ring buffer |
 | process filtering | user-space PID/PPID 기반 filtering |
 | target mode | `--target-pid`, `--target-comm`, `--agent-mode` |
-| 탐지 방식 | built-in rule 기반 |
-| session 분석 | Python `session_analyzer.py` |
+| 분석 방식 | rule/policy 기반 |
+| session 분석 | Python `report.py` 내부 또는 간단한 `session_analyzer.py` |
 | log format | JSONL |
 | report | HTML |
-| 시연 | harmless command 기반 demo script |
+| 시연 | harmless normal/risky demo script |
 
 ---
 
-## 3. 하지 않는 것
+## 4. 하지 않는 것
 
 5주 MVP에서는 아래 기능을 제외한다.
 
 | 제외 기능 | 제외 이유 |
 |---|---|
-| kernel-side target PID filtering | BPF map 기반 filtering과 child tracking 부담 증가 |
-| 실시간 차단 기능 | LSM eBPF, seccomp, fanotify permission event 등 별도 설계 필요 |
-| 모든 syscall 감시 | event 폭증 및 false positive 증가 |
-| `write` 기반 정확한 파일 수정 추적 | fd-to-path mapping이 필요해 MVP 범위를 초과 |
-| packet payload 분석 | 보안/개인정보/구현 부담 증가 |
-| 실시간 Web dashboard | GUI와 engine 동기화 부담 증가 |
-| C 기반 GUI | GTK/Qt C API 학습 부담 증가 |
-| YAML rule parser | C에서 parser 구현 부담 증가 |
-| SQLite 저장 | JSONL로 충분 |
+| 실시간 차단 | eBPF LSM, seccomp, fanotify permission event 설계 필요 |
+| 모든 syscall 감시 | event 폭증, false positive 증가 |
+| AI Agent 자동 제어 | Claude/Codex interactive terminal 처리 부담 |
+| 전체 자동 rollback | Git 작업 손상 가능성, 안전성 문제 |
+| `.env` 자동 백업 기본 활성화 | secret 복사본 생성으로 보안 리스크 증가 |
+| packet payload 분석 | 개인정보/보안/구현 부담 증가 |
 | ML anomaly detection | 데이터셋 부족, 설명 가능성 낮음 |
+| 실시간 Web dashboard | GUI와 engine 동기화 부담 증가 |
+| YAML rule parser | C parser 구현 부담 증가. MVP는 built-in rule 사용 |
+| SQLite 저장 | JSONL로 충분 |
 
-주의할 점:
+주의:
 
 ```text
-MVP는 AI agent를 차단하지 않는다.
-MVP는 AI agent의 행위를 수집, 필터링, 요약, 위험도 평가, report 생성까지만 수행한다.
+MVP는 AI Agent를 차단하지 않는다.
+MVP는 AI Agent의 행위를 수집, 필터링, 요약, 위험도 평가, report 생성까지만 수행한다.
+복구는 Git 명령 안내 수준으로 제한한다.
 ```
 
 ---
 
-## 4. 전체 아키텍처
+## 5. strace/auditd와의 차별점
+
+### strace와의 차이
+
+`strace`는 특정 프로세스의 syscall을 자세히 추적하는 디버깅 도구이다.
+
+```bash
+# Example: trace selected syscalls of a process.
+strace -f -e trace=execve,openat claude
+```
+
+하지만 `strace`는 syscall log를 보여줄 뿐, AI Agent 작업 맥락을 해석하지 않는다.
+
+| 항목 | strace | SysGuard |
+|---|---|---|
+| 목적 | syscall debugging | AI Agent boundary audit |
+| 출력 | low-level syscall log | session summary + safety report |
+| AI Agent session grouping | 없음 | 있음 |
+| project boundary 판단 | 없음 | 있음 |
+| protected path policy | 없음 | 있음 |
+| Git diff 연동 | 없음 | 있음 |
+| Commit Safety 판단 | 없음 | 있음 |
+| GUI/HTML report | 없음 | 있음 |
+
+### auditd와의 차이
+
+`auditd`는 Linux 감사 로그 시스템으로 강력하지만 범용 감사 도구이다.
+
+```bash
+# Example: audit access to .env file.
+sudo auditctl -w /home/user/project/.env -p rwxa -k env_watch
+```
+
+SysGuard는 auditd를 대체하려는 도구가 아니라, AI Agent 개발 workflow에 특화된 해석 계층을 제공한다.
+
+| 항목 | auditd | SysGuard |
+|---|---|---|
+| 목적 | 시스템 감사/audit | AI Agent 작업 안전성 검토 |
+| 설정 | admin 중심 rule | project/agent 중심 policy |
+| 출력 | audit log | Commit Safety Report |
+| AI Agent process tree 분석 | 수동 | 목표 기능 |
+| Git diff와 연결 | 없음 | 있음 |
+| `.env`, `.ssh` 접근의 개발 맥락 해석 | 없음 | 있음 |
+| 공모전 시연성 | 중간 | 높음 |
+
+핵심 차별점:
+
+```text
+strace/auditd:
+- low-level event collection
+
+SysGuard:
+- AI Agent session interpretation
+- project boundary audit
+- Git이 추적하지 못하는 로컬 보안 리스크 분석
+- commit 전 안전성 판단
+```
+
+---
+
+## 6. 전체 아키텍처
 
 ```text
 [Target Process / AI Agent]
@@ -142,32 +242,33 @@ MVP는 AI agent의 행위를 수집, 필터링, 요약, 위험도 평가, report
   libbpf loader
   ring buffer reader
   event decoder
-  rule engine
-  alert manager
-  CLI output
+  CLI alert output
   JSONL output
         |
         | logs/session_*.jsonl
         v
 [Python Analysis Layer]
   target process filter
-  process tree tracker
-  AI agent session analyzer
-  risk score calculator
+  lightweight process filter
+  project boundary checker
+  protected path policy checker
+  dangerous command detector
+  git diff collector
+  commit safety evaluator
   JSONL -> HTML report
         |
         v
 [Python GUI Wrapper]
   Start / Stop
   Log session list
-  Open Agent Session Report
+  Open Commit Safety Report
 ```
 
-설계상 eBPF program은 특정 AI agent를 직접 판단하지 않는다. eBPF는 syscall event를 수집하고, user-space에서 `pid`, `ppid`, `comm`, `exe_path`, `argv`, `path`를 이용해 target process 여부를 판단한다.
+설계상 eBPF program은 특정 AI Agent를 직접 판단하지 않는다. eBPF는 syscall event를 수집하고, user-space에서 `pid`, `ppid`, `comm`, `exe_path`, `argv`, `path`를 이용해 target process와 child process 여부를 판단한다.
 
 ---
 
-## 5. 기술 스택
+## 7. 기술 스택
 
 | 영역 | 기술 |
 |---|---|
@@ -188,13 +289,22 @@ MVP에서는 **Tkinter + 외부 browser HTML report** 구성을 우선한다. Tk
 
 ---
 
-## 6. 역할 분담
+## 8. 역할 분담
 
-### 담당자 A: eBPF / Collector / Engine
+이번 MVP에서는 B에게 GUI, policy, report, Git 요약이 몰리기 때문에 역할을 재조정한다. 핵심 원칙은 다음이다.
 
-**역할:** 커널에서 syscall event를 수집해 C engine으로 전달한다.
+```text
+A = syscall evidence를 생성하는 engine 담당
+B = evidence를 사용자가 이해할 수 있는 Commit Safety Report로 바꾸는 담당
+```
 
-주요 작업:
+즉, B가 raw event를 보정하거나 JSONL writer를 만들지 않도록 한다. A는 B가 바로 읽을 수 있는 **고정 JSONL schema**를 제공해야 한다.
+
+### 담당자 A: eBPF / Collector / Engine / JSONL Evidence
+
+**역할:** 커널에서 syscall event를 수집하고, user-space C engine에서 정규화된 JSONL evidence를 생성한다.
+
+필수 작업:
 
 - `bpf/sysguard.bpf.c` 작성
 - `execve` tracepoint attach
@@ -205,47 +315,117 @@ MVP에서는 **Tkinter + 외부 browser HTML report** 구성을 우선한다. Tk
 - `openat`에서 `path`, `flags` 수집
 - `bpftool gen skeleton` 기반 build 구성
 - `src/bpf_collector.c`에서 ring buffer event 수신
-- real eBPF mode 안정화
-- 시간이 남으면 optional syscall 1~2개 추가
-
-완료 기준:
-
-```text
-sudo ./build/sysguard --output logs/session_test.jsonl
-실행 후 bash, curl, git, python, cat /etc/passwd 같은 실제 행위가 event 또는 alert로 출력된다.
-```
-
-A의 핵심 책임은 session 분석이 아니라 **분석 가능한 event를 정확히 넘겨주는 것**이다.
-
-### 담당자 B: Rule Engine / Session Analyzer / Report / GUI
-
-**역할:** 수집된 event를 보안적으로 해석하고, 특정 process의 session activity로 요약해 사용자에게 보여준다.
-
-주요 작업:
-
-- `src/event.h` 작성
-- `src/alert.h` 작성
+- `src/event.h` 작성 및 event schema 고정
+- `src/jsonl_writer.c` 작성
 - `src/fake_collector.c` 작성
-- `src/rules.c` 작성
-- CLI alert 출력
-- JSONL writer 구현
-- `app/session_analyzer.py` 작성
-- `app/report.py` JSONL to HTML report 구현
-- `app/main.py` GUI 작성
-- AI agent demo script 작성
-- README 및 발표용 sample report 정리
+- `--fake`, `--output`, `--agent-mode`, `--target-comm`, `--project-path` CLI 옵션 처리
+- normal / risky demo script 작성
+- real eBPF mode 안정화
 
-완료 기준:
+선택 작업:
+
+- `unlinkat` tracepoint 추가
+- `renameat` / `fchmodat` / `connect`는 Future Work 또는 추가 구현으로 둔다.
+
+A 완료 기준:
 
 ```text
-./build/sysguard --fake --output logs/session_fake.jsonl
-실행 후 fake event 기반 alert가 출력되고,
-GUI에서 해당 log를 선택해 AI Agent Session Report로 볼 수 있다.
+sudo ./build/sysguard \
+  --agent-mode \
+  --target-comm claude \
+  --project-path /home/sumin/SysGuard \
+  --output logs/session_claude.jsonl
+
+실행 후 logs/session_claude.jsonl에 execve/openat event가 고정 schema로 기록된다.
 ```
 
+예시 JSONL:
+
+```json
+{"timestamp_ns":123456789,"session_id":"session_20260701_001500","event":"execve","pid":3010,"ppid":3000,"uid":1000,"comm":"git","argv":"git reset --hard","path":"","project_path":"/home/sumin/SysGuard","target_comm":"claude"}
+{"timestamp_ns":123456790,"session_id":"session_20260701_001500","event":"openat","pid":3000,"ppid":2500,"uid":1000,"comm":"claude","argv":"","path":"/home/sumin/SysGuard/.env","project_path":"/home/sumin/SysGuard","target_comm":"claude"}
+```
+
+A의 핵심 책임은 session 분석이 아니라 **분석 가능한 syscall evidence를 정확히 넘겨주는 것**이다.
+
+### 담당자 B: Policy / Git Summary / Report / GUI Wrapper
+
+**역할:** A가 생성한 JSONL evidence를 읽고, AI Agent 개발 workflow 관점에서 Commit Safety Report를 생성한다.
+
+필수 작업:
+
+- `app/main.py` GUI wrapper 작성
+- GUI에서 Start/Stop/Open Report 동작 구현
+- `app/report.py`에서 JSONL → HTML report 생성
+- `app/policy.py`에서 protected path / dangerous command rule 구현
+- `app/git_summary.py`에서 `git status`, `git diff --stat` 요약
+- lightweight target/child process filtering
+- project boundary 판단
+- Commit Safety `SAFE`, `REVIEW_NEEDED`, `UNSAFE` 판단
+- sample report 정리
+
+선택 작업:
+
+- 별도 `app/session_analyzer.py` 분리
+- report 디자인 개선
+- log session 목록에 safety 결과 미리 표시
+
+B 제외 범위:
+
+```text
+- eBPF/libbpf 구현
+- C JSONL writer 구현
+- fake collector 구현
+- 실시간 dashboard
+- SQLite 저장
+- YAML rule parser
+- 복구 버튼
+- 전체 rollback
+- process tree graph
+- .env secure backup
+```
+
+B 완료 기준:
+
+```text
+logs/session_*.jsonl을 읽어서 HTML Commit Safety Report를 생성하고,
+GUI에서 해당 report를 열 수 있다.
+```
+
+B의 핵심 책임은 **raw syscall log를 제품 관점의 안전성 판단으로 변환하는 것**이다.
+
+### A/B 인터페이스 계약
+
+A와 B 사이의 계약은 JSONL schema다. 이 schema가 고정되면 B는 eBPF 구현 진행 상황과 독립적으로 fake JSONL 기반 개발을 진행할 수 있다.
+
+필수 field:
+
+| Field | 설명 | 담당 |
+|---|---|---|
+| `timestamp_ns` | event 발생 시간 | A |
+| `session_id` | session 식별자 | A |
+| `event` | `execve`, `openat` 등 | A |
+| `pid` | process id | A |
+| `ppid` | parent process id | A |
+| `uid` | user id | A |
+| `comm` | process name | A |
+| `argv` | execve command line | A |
+| `path` | openat target path | A |
+| `project_path` | GUI/CLI에서 전달한 project root | A |
+| `target_comm` | GUI/CLI에서 전달한 target process | A |
+
+B는 위 field만 사용해서 다음을 판단한다.
+
+```text
+- target process 관련 event인가?
+- project_path 내부 접근인가, 외부 접근인가?
+- protected path 접근인가?
+- dangerous command 실행인가?
+- Commit Safety가 SAFE / REVIEW_NEEDED / UNSAFE 중 무엇인가?
+```
 ---
 
-## 7. 디렉터리 구조
+## 9. 디렉터리 구조
 
 ```text
 sysguard/
@@ -256,7 +436,7 @@ sysguard/
 │   ├── collector.h            # collector-related declarations
 │   ├── fake_collector.c       # fake event generator
 │   ├── bpf_collector.c        # libbpf skeleton loader + ringbuf reader
-│   ├── rules.c                # rule matching logic
+│   ├── rules.c                # low-level event rule matching
 │   ├── rules.h
 │   ├── jsonl_writer.c         # JSONL output writer
 │   └── jsonl_writer.h
@@ -265,10 +445,10 @@ sysguard/
 │   └── vmlinux.h              # kernel type definitions
 ├── app/
 │   ├── main.py                # GUI wrapper app
-│   ├── session_analyzer.py    # target process and AI agent session analysis
-│   ├── risk_score.py          # session-level risk score calculation
-│   ├── report.py              # JSONL to HTML report generator
-│   └── README.md              # GUI usage note
+│   ├── report.py              # JSONL to HTML Commit Safety Report
+│   ├── policy.py              # protected path / dangerous command policy
+│   ├── git_summary.py         # git status/diff summary helper
+│   └── session_analyzer.py    # optional: 분리형 session analysis
 ├── logs/
 │   ├── session_*.jsonl        # monitoring session logs
 │   └── session_*.html         # generated reports
@@ -276,23 +456,23 @@ sysguard/
 │   └── generated files and sysguard binary
 ├── demo/
 │   ├── benign_simulator.sh
-│   └── ai_agent_simulator.sh
+│   ├── agent_normal_simulator.sh
+│   └── agent_boundary_violation_simulator.sh
 ├── reports/
-│   ├── sample_alerts.jsonl
-│   └── sample_agent_report.html
+│   └── sample_report.html
 ├── docs/
 │   ├── architecture.md
-│   ├── rules.md
-│   └── agent_session_model.md
+│   ├── policy.md
+│   └── strace_auditd_comparison.md
 ├── Makefile
 └── README.md
 ```
 
 ---
 
-## 8. Event Interface
+## 10. Event Interface
 
-`struct sysguard_event`는 eBPF collector와 rule engine 사이의 공통 계약이다.
+`struct sysguard_event`는 eBPF collector와 user-space 분석 계층 사이의 공통 계약이다.
 
 ```c
 #ifndef SYSGUARD_EVENT_H
@@ -310,7 +490,7 @@ enum sysguard_event_type {
     SYSGUARD_EVENT_EXEC = 1,
     SYSGUARD_EVENT_OPEN = 2,
 
-    // Optional events. Implement only when MVP is stable.
+    // Optional event types for future extensions.
     SYSGUARD_EVENT_UNLINK = 3,
     SYSGUARD_EVENT_RENAME = 4,
     SYSGUARD_EVENT_CHMOD = 5,
@@ -335,273 +515,252 @@ struct sysguard_event {
 
     // File event fields.
     char path[SYSGUARD_MAX_PATH];
-    char path2[SYSGUARD_MAX_PATH];  // Used by rename-like events.
+    char old_path[SYSGUARD_MAX_PATH];
+    char new_path[SYSGUARD_MAX_PATH];
     int32_t flags;
-    uint32_t mode;
-
-    // Network event fields. Optional for MVP.
-    uint32_t dst_ip;
-    uint16_t dst_port;
+    int32_t mode;
 };
 
 #endif
 ```
 
-MVP에서는 `SYSGUARD_EVENT_EXEC`, `SYSGUARD_EVENT_OPEN`만 반드시 구현한다. Optional event field는 interface 확장성을 위해 예약해둔다.
+MVP에서 실제로 구현할 필수 field:
 
----
+```text
+execve:
+- timestamp_ns
+- pid
+- ppid
+- uid
+- comm
+- exe_path
+- argv
 
-## 9. Alert Interface
-
-모든 alert는 `severity`, `reason`, `recommendation`을 포함해야 한다.
-
-```c
-#ifndef SYSGUARD_ALERT_H
-#define SYSGUARD_ALERT_H
-
-#include <stdint.h>
-
-#define SYSGUARD_MAX_REASON 256
-#define SYSGUARD_MAX_RECOMMENDATION 256
-#define SYSGUARD_MAX_RULE_ID 64
-
-// Alert severity levels used by the rule engine.
-enum sysguard_severity {
-    SYSGUARD_SEV_LOW = 1,
-    SYSGUARD_SEV_MEDIUM = 2,
-    SYSGUARD_SEV_HIGH = 3,
-    SYSGUARD_SEV_CRITICAL = 4,
-};
-
-// Security alert produced by rule evaluation.
-struct sysguard_alert {
-    uint64_t timestamp_ns;
-    char rule_id[SYSGUARD_MAX_RULE_ID];
-    enum sysguard_severity severity;
-
-    uint32_t pid;
-    uint32_t ppid;
-    uint32_t uid;
-    char comm[16];
-
-    char reason[SYSGUARD_MAX_REASON];
-    char recommendation[SYSGUARD_MAX_RECOMMENDATION];
-};
-
-const char *sysguard_severity_string(enum sysguard_severity severity);
-
-#endif
+openat:
+- timestamp_ns
+- pid
+- ppid
+- uid
+- comm
+- path
+- flags
 ```
 
----
+### JSONL Output Schema
 
-## 10. JSONL Log Format
-
-JSONL은 event와 alert를 모두 저장한다. session analyzer는 이 파일을 읽어 target process report를 만든다.
-
-Event line 예시:
+A는 B가 바로 사용할 수 있도록 아래 JSONL schema를 고정한다. B는 raw event 보정 없이 이 schema만 읽는다.
 
 ```json
-{"record_type":"event","timestamp_ns":123456789,"event":"exec","pid":3101,"ppid":3000,"uid":1000,"comm":"git","exe_path":"/usr/bin/git","argv":"git status"}
+{
+  "timestamp_ns": 123456789,
+  "session_id": "session_20260701_001500",
+  "event": "execve",
+  "pid": 3010,
+  "ppid": 3000,
+  "uid": 1000,
+  "comm": "git",
+  "argv": "git reset --hard",
+  "path": "",
+  "project_path": "/home/sumin/SysGuard",
+  "target_comm": "claude"
+}
 ```
 
-Alert line 예시:
+`openat` event 예시:
 
 ```json
-{"record_type":"alert","timestamp_ns":123456999,"rule_id":"env-file-access","severity":"high","pid":3102,"ppid":3000,"comm":"cat","reason":".env file was accessed","recommendation":"Review whether secrets were exposed."}
+{
+  "timestamp_ns": 123456790,
+  "session_id": "session_20260701_001500",
+  "event": "openat",
+  "pid": 3000,
+  "ppid": 2500,
+  "uid": 1000,
+  "comm": "claude",
+  "argv": "",
+  "path": "/home/sumin/SysGuard/.env",
+  "project_path": "/home/sumin/SysGuard",
+  "target_comm": "claude"
+}
 ```
 
 ---
 
-## 11. Target Process / AI Agent Session Model
+## 11. Policy 기준
 
-SysGuard의 process-specific monitoring은 kernel-space attach 대상 자체를 특정 process로 제한하는 방식이 아니다.
+SysGuard는 레포지토리 내부 파일 수정 자체를 이상 행위로 판단하지 않는다.
 
-```text
-시스템 전체 syscall event 수집
-→ user-space에서 target process 식별
-→ target process와 child process event만 filtering
-→ session 단위로 activity report 생성
-```
+### 정상 개발 활동
 
-### Target process 지정 방식
-
-```bash
-# Monitor events related to a specific PID and its child processes.
-sudo ./build/sysguard --target-pid 3000 --output logs/session_target.jsonl
-
-# Monitor events related to processes whose command name matches claude.
-sudo ./build/sysguard --target-comm claude --output logs/session_claude.jsonl
-
-# Enable built-in AI agent process detection.
-sudo ./build/sysguard --agent-mode --output logs/session_agent.jsonl
-```
-
-MVP에서는 CLI option이 완전히 동작하지 않더라도, JSONL 생성 후 `session_analyzer.py`에서 같은 filtering을 수행해도 된다.
-
-### AI agent process 후보
+아래는 일반적으로 정상 활동으로 분류한다.
 
 ```text
-claude
-codex
-gemini
-cursor
-code
-node
-python
-bash
+- src/*.c 수정
+- README.md 수정
+- Makefile 수정
+- test 파일 생성
+- git status 실행
+- git diff 실행
+- make 실행
+- python test.py 실행
+- npm test 실행
 ```
 
-`node`, `python`, `bash`는 너무 일반적이므로 단독으로 AI agent로 확정하지 않는다. 다음 조건을 같이 본다.
+### 위험 행위 기준
+
+위험 여부는 다음 기준으로 판단한다.
 
 ```text
-argv에 claude, codex, gemini, cursor 관련 문자열 포함
-parent process가 claude/codex/gemini/cursor/code 계열
-프로젝트 디렉터리에서 짧은 시간 안에 다수 file open/exec event 발생
-```
+1. Project boundary violation
+   - project_path 바깥의 파일 접근
 
-### Process tree tracking
+2. Protected path access
+   - .env
+   - .env.local
+   - config/secrets.json
+   - ~/.ssh/
+   - ~/.aws/credentials
+   - /etc/shadow
+   - /etc/sudoers
 
-```text
-AI Agent PID 3000
-├── git PID 3010
-├── python PID 3011
-├── bash PID 3012
-└── cat PID 3013
-```
+3. Dangerous command execution
+   - rm -rf
+   - git reset --hard
+   - git clean -fd
+   - chmod 777
+   - chown root
+   - curl / wget / nc / netcat
 
-Session analyzer는 다음 규칙으로 event를 session에 포함한다.
-
-```text
-event.pid == target_pid
-또는 event.ppid == target_pid
-또는 event.ppid가 이미 session에 포함된 child pid
+4. Suspicious sequence
+   - .env 접근 후 curl/wget 실행
+   - protected path 접근 후 network tool 실행
 ```
 
 ---
 
-## 12. 이상행위 기준
+## 12. Policy 예시
 
-SysGuard에서 이상행위는 악성행위의 확정 판정이 아니다.
-
-본 프로젝트에서는 이상행위를 다음과 같이 정의한다.
-
-> Linux 환경에서 침해 사고, 권한 상승, 정보 탈취, 컨테이너 오남용, AI agent의 과도한 로컬 권한 사용과 연관될 가능성이 높은 syscall event 또는 event sequence
-
-### 기준 1: 민감 자원 접근
-
-```text
-/etc/shadow
-/etc/sudoers
-/var/run/docker.sock
-/home/*/.ssh/id_rsa
-/home/*/.ssh/config
-.env
-.env.local
-.env.production
-config/secrets.*
+```json
+{
+  "project_path": "/home/sumin/SysGuard",
+  "target_processes": [
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "code"
+  ],
+  "protected_paths": [
+    ".env",
+    ".env.local",
+    "config/secrets.json",
+    "~/.ssh/",
+    "~/.aws/credentials",
+    "/etc/shadow",
+    "/etc/sudoers"
+  ],
+  "dangerous_commands": [
+    "rm -rf",
+    "git reset --hard",
+    "git clean -fd",
+    "chmod 777",
+    "chown root",
+    "curl",
+    "wget",
+    "nc",
+    "netcat"
+  ]
+}
 ```
 
-### 기준 2: 위험 command 실행
+MVP에서는 JSON parser 없이 Python dictionary 또는 built-in list로 처리해도 된다.
+
+---
+
+## 13. Commit Safety 판단
+
+### SAFE
 
 ```text
-bash, sh, zsh
-nc, netcat, ncat
-curl, wget
-python, perl, ruby
-git reset --hard
-rm -rf
-chmod 777
-chown root
+Commit Safety: SAFE
+
+조건:
+- project_path 내부 파일만 접근/수정
+- protected path 접근 없음
+- dangerous command 실행 없음
+- project boundary violation 없음
 ```
 
-### 기준 3: 정책 위반
+### REVIEW_NEEDED
 
 ```text
-일반 사용자 프로세스가 /etc/shadow 접근
-non-allowlisted process가 Docker socket 접근
-학생 실습 VM에서 netcat 실행
-AI agent session에서 .env 또는 SSH private key 접근
-AI agent session에서 destructive command 실행
+Commit Safety: REVIEW_NEEDED
+
+조건:
+- 많은 파일 수정
+- build/config 파일 변경
+- 삭제성 명령이 실행됐지만 sandbox/build artifact에 한정됨
+- 위험하지는 않지만 사람이 검토해야 하는 작업 존재
 ```
 
-### 기준 4: event sequence
-
-MVP에서는 optional이다.
+### UNSAFE
 
 ```text
-curl 실행 → shell 실행
-shell 실행 → 민감 파일 접근
-AI agent 실행 → .env 접근 → 외부 연결
-AI agent 실행 → 다수 파일 접근 → rm/chmod 실행
+Commit Safety: UNSAFE
+
+조건:
+- .env 접근
+- ~/.ssh/ 접근
+- /etc/shadow, /etc/sudoers 접근
+- project_path 외부 접근
+- git reset --hard 실행
+- rm -rf 실행
+- .env 접근 이후 curl/wget/nc 실행
 ```
 
 ---
 
-## 13. MVP Rule 목록
+## 14. Rule 목록
 
-| Rule ID | Event | Severity | 설명 |
-|---|---|---|---|
-| `shell-exec` | `execve` | medium | shell process 실행 |
-| `suspicious-netcat` | `execve` | high | netcat 계열 command 실행 |
-| `downloader-exec` | `execve` | medium | `curl`, `wget` 실행 |
-| `sensitive-shadow-access` | `openat` | critical | `/etc/shadow` 접근 |
+| Rule ID | 기준 | Severity | 설명 |
+|---|---|---:|---|
+| `project-boundary-access` | `openat` | high | project_path 바깥 파일 접근 |
+| `env-file-access` | `openat` | high | `.env` 접근 |
+| `ssh-key-access` | `openat` | critical | SSH key 접근 |
+| `shadow-access` | `openat` | critical | `/etc/shadow` 접근 |
 | `sudoers-access` | `openat` | high | `/etc/sudoers` 접근 |
-| `docker-sock-access` | `openat` | high | Docker socket 접근 |
-| `ssh-key-access` | `openat` | high | SSH private key 접근 |
-| `env-file-access` | `openat` | high | `.env` 계열 파일 접근 |
-| `agent-sensitive-access` | sequence | high | AI agent session 중 민감 파일 접근 |
-| `agent-dangerous-command` | sequence | high | AI agent session 중 위험 명령 실행 |
-
-Optional rule:
-
-| Rule ID | Event | Severity | 설명 |
-|---|---|---|---|
-| `download-and-shell` | sequence | high | downloader 실행 후 shell 실행 |
-| `agent-mass-file-access` | sequence | medium | AI agent session 중 짧은 시간 내 다수 파일 접근 |
-| `agent-delete-file` | `unlinkat` | high | AI agent session 중 파일 삭제 |
-| `agent-rename-burst` | `renameat` | high | AI agent session 중 다수 파일 이름 변경 |
-| `agent-outbound-connect` | `connect` | medium | AI agent session 중 외부 연결 |
+| `destructive-rm` | `execve` | high | `rm -rf` 실행 |
+| `git-reset-hard` | `execve` | high | `git reset --hard` 실행 |
+| `git-clean-force` | `execve` | high | `git clean -fd` 실행 |
+| `unsafe-chmod` | `execve` 또는 `fchmodat` | medium/high | `chmod 777` 등 위험 권한 변경 |
+| `downloader-exec` | `execve` | medium | `curl`, `wget` 실행 |
+| `possible-secret-exfiltration` | sequence | critical | `.env` 접근 후 외부 전송 의심 명령 |
 
 ---
 
-## 14. Optional Syscall 확장 우선순위
+## 15. Optional syscall 추천
 
-`execve`, `openat`이 안정화된 뒤 시간이 남으면 아래 순서로 추가한다.
+필수는 `execve`, `openat`이다. 시간이 남으면 아래 순서로 추가한다.
 
-| 우선순위 | syscall | 목적 | 난이도 | 추천 여부 |
-|---:|---|---|---|---|
-| 1 | `unlinkat` / `unlink` | 파일 삭제 탐지 | 낮음~중간 | 가장 추천 |
-| 2 | `renameat` / `renameat2` | 파일 rename, ransomware-like rename 탐지 | 중간 | 추천 |
-| 3 | `fchmodat` / `chmod` | 권한 변경 탐지, `chmod 777` 탐지 | 중간 | 추천 |
-| 4 | `exit_group` | process/session 종료 시점 파악 | 낮음 | report 품질 개선용 |
-| 5 | `connect` | outbound network 연결 탐지 | 중간~높음 | 시간 남을 때 |
-| 6 | `execveat` | `execve` 변형 대응 | 낮음~중간 | 보완용 |
-| 7 | `openat2` | 최신 open 계열 syscall 대응 | 중간 | 보완용 |
+| 우선순위 | syscall | 이유 | 담당 |
+|---:|---|---|---|
+| 1 | `unlinkat` | 실제 파일 삭제 감지 | A |
+| 2 | `renameat` / `renameat2` | 파일 rename, ransomware-like behavior 실마리 | A |
+| 3 | `fchmodat` / `chmod` | 실제 권한 변경 감지 | A |
+| 4 | `exit_group` | session 종료 시점 파악 | A |
+| 5 | `connect` | 외부 연결 감지. IPv4/IPv6 decoding 부담 있음 | A |
 
-### 가장 먼저 추가할 syscall
+주의:
 
 ```text
-1순위: unlinkat
-2순위: renameat 또는 renameat2
-3순위: fchmodat 또는 chmod
+write syscall은 MVP에서 비추천한다.
+write(fd, buf, count)는 path를 직접 주지 않기 때문에 fd-to-path mapping이 필요하다.
+5주 MVP에서는 openat + unlinkat + renameat + chmod 쪽이 더 현실적이다.
 ```
-
-이 세 개는 AI agent가 로컬 파일을 건드릴 때 발생할 수 있는 문제와 직접 연결된다.
-
-```text
-unlinkat  → 파일 삭제
-renameat  → 파일 이름 변경 또는 대량 rename
-fchmodat  → 파일 권한 변경
-```
-
-`connect`도 매력적이지만 IPv4/IPv6 구조체 decoding과 테스트 부담이 있어 5주 MVP에서는 후순위로 둔다.
-
-`write`는 직관적으로 좋아 보이지만 MVP에서는 비추천한다. `write(fd, buf, count)`는 path를 직접 주지 않기 때문에 fd-to-path mapping을 따로 유지해야 한다.
 
 ---
 
-## 15. Build Requirements
+## 16. Build Requirements
 
 Ubuntu VM 기준으로 개발한다.
 
@@ -637,7 +796,7 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 
 ---
 
-## 16. Build & Run
+## 17. Build & Run
 
 ```bash
 # Build SysGuard engine.
@@ -658,39 +817,53 @@ Real eBPF mode:
 sudo ./build/sysguard --output logs/session_real.jsonl
 ```
 
-Target process mode:
+Agent boundary monitor mode:
 
 ```bash
-# Monitor a specific PID and its child processes.
-sudo ./build/sysguard --target-pid 3000 --output logs/session_target.jsonl
+# Start monitoring and later analyze events for claude process.
+sudo ./build/sysguard \
+  --agent-mode \
+  --target-comm claude \
+  --project-path /home/sumin/SysGuard \
+  --output logs/session_claude.jsonl
 ```
 
-Agent mode:
+Generate report:
 
 ```bash
-# Monitor AI-agent-like process activity.
-sudo ./build/sysguard --agent-mode --output logs/session_agent.jsonl
+# Generate Commit Safety Report.
+python3 app/report.py \
+  --input logs/session_claude.jsonl \
+  --agent claude \
+  --project-path /home/sumin/SysGuard \
+  --output logs/session_claude.html
+```
+
+Open report:
+
+```bash
+# Open generated HTML report.
+xdg-open logs/session_claude.html
 ```
 
 GUI mode:
 
 ```bash
-# Run GUI wrapper.
+# MVP에서는 eBPF load 권한 문제를 단순화하기 위해 GUI를 sudo로 실행한다.
 sudo python3 app/main.py
 ```
 
-공모전 demo에서는 eBPF load 권한 문제를 단순화하기 위해 GUI를 `sudo`로 실행한다. 실서비스 수준에서는 GUI와 privileged backend를 분리하는 구조가 필요하다.
-
 ---
 
-## 17. GUI 동작 방식
+## 18. GUI 동작 방식
 
 ### Start Monitoring
 
 ```text
 Start button 클릭
+→ project_path와 target process 읽기
 → logs/session_YYYYMMDD_HHMMSS.jsonl 생성
-→ ./build/sysguard --agent-mode --output logs/session_YYYYMMDD_HHMMSS.jsonl 실행
+→ ./build/sysguard --agent-mode --target-comm <target> --project-path <path> 실행
 → GUI status를 Running으로 변경
 ```
 
@@ -704,104 +877,130 @@ Stop button 클릭
 → GUI status를 Stopped로 변경
 ```
 
-### Log Session List
-
-```text
-logs/*.jsonl scan
-→ file name, modified time, alert count, critical/high count, agent session count 표시
-```
-
-### Open HTML Report
+### Open Commit Safety Report
 
 ```text
 선택한 JSONL log 읽기
-→ session_analyzer.py로 target/agent session summary 생성
+→ session_analyzer.py 실행
+→ project boundary / protected path / dangerous command 분석
+→ Git diff/status 요약
 → HTML report 생성
-→ logs/session_YYYYMMDD_HHMMSS.html 저장
-→ browser 또는 GUI WebView로 열기
+→ browser로 열기
 ```
 
 ---
 
-## 18. GUI 화면 MVP
+## 19. GUI 화면 MVP
 
 ```text
-+------------------------------------------------------------------+
-| SysGuard Monitor                                                 |
-| eBPF Linux Runtime Security Monitor + AI Agent Profiler          |
-+------------------------------------------------------------------+
-| [ Start Monitoring ] [ Stop ] [ Refresh Logs ]                   |
-| Status: Stopped                                                  |
-+------------------------------------------------------------------+
-| Log Sessions                                                     |
-|------------------------------------------------------------------|
-| session_20260624_142100.jsonl | 12 alerts | 2 crit | 1 agent   |
-| session_20260624_143500.jsonl |  8 alerts | 1 crit | 0 agent   |
-| session_20260624_151000.jsonl | 15 alerts | 3 crit | 2 agents  |
-+------------------------------------------------------------------+
-| [ Open HTML Report ]                                             |
-+------------------------------------------------------------------+
++------------------------------------------------------+
+| SysGuard - AI Agent Boundary Auditor                 |
++------------------------------------------------------+
+| Project Path:   /home/sumin/SysGuard                 |
+| Target Process: claude                               |
+|                                                      |
+| [ Start Monitoring ] [ Stop ]                        |
++------------------------------------------------------+
+| Status: Stopped                                      |
++------------------------------------------------------+
+| Log Sessions                                         |
+|------------------------------------------------------|
+| session_claude_20260701_142100.jsonl | UNSAFE        |
+| session_claude_20260701_143500.jsonl | SAFE          |
+| session_claude_20260701_151000.jsonl | REVIEW        |
++------------------------------------------------------+
+| [ Open Commit Safety Report ]                        |
++------------------------------------------------------+
 ```
 
 ---
 
-## 19. HTML Report 구성
+## 20. HTML Report 구성
 
 HTML report는 선택한 JSONL session을 사람이 보기 쉽게 요약한다.
 
 포함 항목:
 
 ```text
-1. Session file name
-2. Total event count
-3. Total alert count
-4. Severity summary
-5. Rule별 발생 횟수
-6. Target process summary
-7. AI agent session summary
-8. Files accessed
-9. Commands executed
-10. Sensitive files accessed
-11. Dangerous commands
-12. Risk score
-13. Recommendation
-14. Recent alert table
+1. Session metadata
+2. Target process / project path
+3. Commit Safety result
+4. Normal development activity summary
+5. Boundary violation summary
+6. Protected path access summary
+7. Dangerous command summary
+8. Git status/diff summary
+9. Recent event table
+10. Recommended actions
 ```
 
 예시:
 
 ```text
-SysGuard Agent Session Report
+SysGuard Commit Safety Report
 
-Target: claude
-Duration: 14:01:03 ~ 14:18:42
-Total Events: 184
-Executed Commands: 32
-Files Accessed: 104
-Sensitive Files Accessed: 2
-Dangerous Commands: 1
+Target Agent: claude
+Project Path: /home/sumin/SysGuard
+Commit Safety: UNSAFE
+Risk Level: HIGH
 
-Risk: HIGH
+Normal Development Activity:
+- README.md opened
+- src/main.c modified
+- make executed
 
-Key Findings
-- .env file was accessed by an AI-agent-related process.
-- git reset --hard was executed during the session.
-- Multiple project files were accessed in a short time window.
+Boundary Violations:
+- /home/sumin/.ssh/config accessed
+- .env accessed
 
-Recommended Actions
+Dangerous Commands:
+- git reset --hard
+- rm -rf build/
+
+Recommended Actions:
 - Review git diff before commit.
-- Check whether secrets were exposed.
-- Rotate API keys if .env contains real credentials.
-
-Recent Alerts
-- [high] env-file-access pid=18345 comm=cat path=/home/user/project/.env
-- [high] agent-dangerous-command pid=18350 comm=git argv="git reset --hard"
-- [medium] downloader-exec pid=18331 comm=curl
+- Check whether .env content was exposed.
+- Rotate API keys if exposure is suspected.
+- Avoid committing until boundary violations are reviewed.
 ```
 
 ---
 
-## 20. Makefile 예시
+## 21. `.env` 처리 정책
+
+`.env`는 보통 Git이 추적하지 않는 로컬 secret file이다. 따라서 Git만으로는 수정/삭제 복구가 어렵다.
+
+MVP 정책:
+
+```text
+- .env 접근 여부를 HIGH alert로 표시한다.
+- .env 내용은 JSONL이나 HTML report에 절대 저장하지 않는다.
+- .env가 접근되면 Commit Safety를 UNSAFE로 표시한다.
+- 복구보다 secret exposure 대응을 안내한다.
+```
+
+권장 대응:
+
+```text
+1. .env에 어떤 secret이 있었는지 확인한다.
+2. AI Agent transcript 또는 command output에 secret이 노출됐는지 확인한다.
+3. 노출 가능성이 있으면 API key/token/password를 rotate한다.
+4. .env는 .gitignore에 유지한다.
+5. .env.example에는 key 이름만 보관한다.
+```
+
+Optional future work:
+
+```text
+Secure Backup Mode:
+- 사용자가 명시적으로 켠 경우에만 .env를 .sysguard/snapshots/... 에 600 권한으로 백업한다.
+- 기본값은 OFF로 둔다.
+- HTML report에는 secret 내용을 절대 출력하지 않는다.
+```
+
+---
+
+## 22. Makefile 예시
 
 ```makefile
 # SysGuard C MVP Makefile.
@@ -822,7 +1021,7 @@ USER_SRC := \
 	src/jsonl_writer.c \
 	src/bpf_collector.c
 
-.PHONY: all clean run-fake run-real run-agent run-gui
+.PHONY: all clean run-fake run-real run-gui run-agent
 
 all: $(BIN)
 
@@ -850,10 +1049,10 @@ run-real: $(BIN)
 	mkdir -p logs
 	sudo ./$(BIN) --output logs/session_real.jsonl
 
-# Run AI-agent mode.
+# Run agent boundary monitor mode.
 run-agent: $(BIN)
 	mkdir -p logs
-	sudo ./$(BIN) --agent-mode --output logs/session_agent.jsonl
+	sudo ./$(BIN) --agent-mode --target-comm claude --project-path $$(pwd) --output logs/session_claude.jsonl
 
 # Run GUI wrapper.
 run-gui: $(BIN)
@@ -866,137 +1065,169 @@ clean:
 
 ---
 
-## 21. Demo Script
+## 23. Demo Script
 
-### Basic demo
+### 정상 개발 활동 demo
 
-`demo/benign_simulator.sh`
+`demo/agent_normal_simulator.sh`
 
 ```bash
 #!/usr/bin/env bash
-# This script triggers SysGuard rules using harmless commands.
-# It must not exploit, persist, exfiltrate, or damage the system.
+# This script simulates normal AI agent development activity.
+# It only reads or modifies safe project-local demo files.
 
 set -euo pipefail
 
-echo "[demo] Trigger shell execution event"
-bash -c 'echo hello-from-demo'
+PROJECT_DIR="$(pwd)"
+SANDBOX_DIR="$PROJECT_DIR/demo/sandbox_normal"
 
-echo "[demo] Trigger sensitive file access event"
-cat /etc/passwd >/dev/null
+mkdir -p "$SANDBOX_DIR"
 
-echo "[demo] Trigger downloader-like execution event"
-curl --version >/dev/null || true
+echo "[demo] Simulate reading project files"
+cat README.md >/dev/null || true
 
-echo "[demo] Trigger docker socket path check if it exists"
-if [ -S /var/run/docker.sock ]; then
-  ls -l /var/run/docker.sock >/dev/null
-fi
+echo "[demo] Simulate modifying a project-local file"
+echo "normal update" >> "$SANDBOX_DIR/notes.txt"
+
+echo "[demo] Simulate normal development commands"
+git status >/dev/null || true
+make --version >/dev/null || true
+python3 --version >/dev/null || true
 
 echo "[demo] Done"
 ```
 
-### AI agent session demo
+Expected report:
 
-`demo/ai_agent_simulator.sh`
+```text
+Commit Safety: SAFE or REVIEW_NEEDED
+Reason:
+- Only project-local development activity was observed.
+- No protected path access detected.
+- No dangerous command detected.
+```
+
+### Boundary violation demo
+
+`demo/agent_boundary_violation_simulator.sh`
 
 ```bash
 #!/usr/bin/env bash
-# This script simulates AI-agent-like local activity using harmless commands.
-# It does not delete, encrypt, exfiltrate, exploit, or persist anything.
+# This script simulates risky AI agent behavior in a controlled way.
+# It must not exploit, persist, exfiltrate, or damage the system.
 
 set -euo pipefail
 
-DEMO_DIR="/tmp/sysguard-agent-demo"
-mkdir -p "$DEMO_DIR"
-cd "$DEMO_DIR"
+PROJECT_DIR="$(pwd)"
+SANDBOX_DIR="$PROJECT_DIR/demo/sandbox_risky"
 
-# Create harmless project-like files.
-echo 'print("hello")' > main.py
-echo 'demo_key=not-a-real-secret' > .env
-echo '# demo' > README.md
+mkdir -p "$SANDBOX_DIR/build"
+echo "SECRET_KEY=dummy_value" > "$SANDBOX_DIR/.env"
+echo "echo test" > "$SANDBOX_DIR/test.sh"
 
-echo "[agent-demo] Simulate reading project files"
-cat README.md >/dev/null
-cat main.py >/dev/null
+echo "[demo] Simulate sensitive file access inside project sandbox"
+cat "$SANDBOX_DIR/.env" >/dev/null
 
-# This intentionally touches .env to trigger a sensitive-file rule.
-echo "[agent-demo] Simulate sensitive file access"
-cat .env >/dev/null
+echo "[demo] Simulate unsafe permission command"
+chmod 777 "$SANDBOX_DIR/test.sh"
 
-echo "[agent-demo] Simulate development commands"
-git --version >/dev/null || true
-python3 --version >/dev/null || true
+echo "[demo] Simulate recursive delete inside sandbox only"
+rm -rf "$SANDBOX_DIR/build"
 
-echo "[agent-demo] Done"
+echo "[demo] Simulate destructive Git command pattern without executing it"
+bash -c 'echo "git reset --hard" >/dev/null'
+
+echo "[demo] Done"
 ```
 
-GUI 시연 순서:
+Expected report:
 
 ```text
-1. sudo python3 app/main.py
-2. Start Monitoring 클릭
-3. demo/ai_agent_simulator.sh 실행
-4. Stop 클릭
-5. Refresh Logs 클릭
-6. 생성된 session log 선택
-7. Open HTML Report 클릭
-8. AI Agent Session Summary 확인
+Commit Safety: UNSAFE or REVIEW_NEEDED
+Reason:
+- .env-like file accessed.
+- chmod 777 detected.
+- rm -rf detected inside sandbox.
 ```
+
+주의: 실제 demo에서는 `/etc/shadow`, real SSH key, real API key를 사용하지 않는다.
 
 ---
 
-## 22. 5주 개발 계획
+## 24. 5주 개발 계획
+
+작업량 균형을 위해 Week 1부터 JSONL schema와 fake log를 먼저 고정한다. 실제 eBPF가 늦어져도 B는 fake JSONL로 report/GUI 개발을 진행할 수 있어야 한다.
 
 | 주차 | 담당자 A | 담당자 B | 완료 기준 |
 |---|---|---|---|
-| Week 1 | libbpf-bootstrap 구조 파악, skeleton build 실험 | C fake collector, event/alert/rule engine | `make run-fake`로 alert 출력 |
-| Week 2 | `execve` tracepoint PoC, `pid/ppid/uid/comm/argv` 수집 | CLI 출력, JSONL writer, GUI skeleton | fake mode에서 JSONL 생성, GUI 실행 |
-| Week 3 | ring buffer event decode, 실제 `execve` 통합 | target process filter, process tree tracker 초안 | 실제 `bash`, `curl`, `git` event가 target session에 포함됨 |
-| Week 4 | `openat` tracepoint, path 수집 | sensitive file rule, agent session analyzer, GUI Start/Stop 안정화 | `.env`, `/etc/passwd`, Docker socket alert 및 agent summary 생성 |
-| Week 5 | Ubuntu VM 재현성, Makefile 정리, optional syscall 1개 검토 | README, sample report, 발표자료, demo flow | GUI에서 Start→Stop→Agent Report 시연 가능 |
+| Week 1 | `event.h`, fake collector, JSONL writer, CLI option skeleton | fake JSONL 기반 HTML report mockup, policy rule 초안 | `make run-fake`로 JSONL 생성, B가 report 생성 |
+| Week 2 | `execve` tracepoint PoC, `pid/ppid/uid/comm/argv` 기록 | GUI skeleton, Start/Stop/Open Report 버튼 | fake mode에서 GUI로 report 열기 |
+| Week 3 | `openat` tracepoint PoC, path/flags 수집, real JSONL 안정화 | protected path rule, dangerous command rule, project boundary rule | real exec/open event가 report에 반영 |
+| Week 4 | `--target-comm`, `--project-path`, demo script 안정화, optional `unlinkat` 시도 | Git diff/status summary, Commit Safety 판단 완성 | SAFE/REVIEW/UNSAFE report 생성 |
+| Week 5 | Ubuntu VM 재현성, Makefile 정리, eBPF 시연 안정화 | sample report, GUI polish, README/발표자료 정리 | GUI에서 Start→Stop→Report 시연 가능 |
 
-Optional syscall 개발은 Week 5 이전에 `execve/openat`이 안정화된 경우에만 진행한다.
-
----
-
-## 23. 개발 순서
+### 작업량 조정 원칙
 
 ```text
-1. event.h 작성
-2. alert.h 작성
+A가 반드시 제공해야 하는 것:
+- execve/openat evidence
+- 고정 JSONL schema
+- fake mode
+- demo script
+
+B가 반드시 제공해야 하는 것:
+- JSONL parser
+- policy rule
+- Git summary
+- HTML Commit Safety Report
+- GUI wrapper
+
+이번 MVP에서 제외하는 것:
+- 실시간 dashboard
+- 복구 버튼
+- SQLite
+- YAML parser
+- process tree graph
+- .env secure backup
+```
+---
+
+## 25. 개발 순서
+
+개발 순서는 B가 A의 real eBPF 구현을 기다리지 않도록 구성한다.
+
+```text
+1. JSONL schema 확정
+2. event.h 작성
 3. fake_collector.c 작성
-4. rules.c 작성
-5. main.c에서 --fake mode 실행
-6. JSONL writer 추가
-7. app/report.py 작성
-8. app/main.py GUI skeleton 작성
-9. app/session_analyzer.py 작성
-10. target process filtering 구현
-11. process tree tracking 구현
-12. demo script 작성
-13. execve eBPF collector 구현
-14. openat eBPF collector 구현
-15. GUI Start/Stop과 real engine 연결
-16. Agent Session Report 생성
-17. optional syscall 추가 여부 결정
-18. README 기준으로 clean VM 재현성 테스트
+4. jsonl_writer.c 작성
+5. main.c에서 --fake, --output, --agent-mode, --target-comm, --project-path option 처리
+6. fake JSONL sample 생성
+7. app/policy.py 작성
+8. app/report.py 기본 HTML 생성
+9. app/git_summary.py 작성
+10. app/main.py GUI skeleton 작성
+11. execve eBPF collector 구현
+12. openat eBPF collector 구현
+13. GUI Start/Stop과 real engine 연결
+14. Commit Safety Report 완성
+15. optional: unlinkat 추가
+16. clean VM에서 README 기준 재현성 테스트
 ```
 
 최종 완료 흐름:
 
 ```text
-GUI에서 Start Monitoring
-→ AI-agent-like demo script 실행
+GUI에서 Project Path / Target Process 입력
+→ Start Monitoring
+→ Claude Code 또는 demo script 실행
 → Stop
 → log session 선택
-→ Open HTML Report
-→ Agent Session Summary 확인
+→ Open Commit Safety Report
 ```
-
 ---
 
-## 24. 안전 기준
+## 26. 안전 기준
 
 공모전 demo는 실제 공격 도구처럼 동작하면 안 된다.
 
@@ -1008,91 +1239,97 @@ exploit 자동화
 권한 상승 시도
 persistence 생성
 외부 서버로 데이터 전송
-파일 삭제/암호화/변조
-실제 credential 출력 또는 저장
-실제 SSH private key 접근 demo
+실제 secret 출력
+실제 SSH key 접근
+실제 시스템 파일 변경
+사용자 파일 삭제/암호화/변조
 ```
 
 허용:
 
 ```text
+project-local sandbox 내부 파일 접근
+fake .env 파일 접근
+chmod 777 demo/sandbox/test.sh
+rm -rf demo/sandbox/build
 bash -c 'echo hello'
-cat /etc/passwd >/dev/null
-cat /tmp/sysguard-agent-demo/.env >/dev/null
-curl --version
-ls -l /var/run/docker.sock
+git status
+make --version
 python3 --version
-git --version
+curl --version
 ```
-
-`.env` demo는 반드시 `/tmp/sysguard-agent-demo/.env`처럼 직접 만든 가짜 파일을 사용한다.
 
 ---
 
-## 25. 발표 포인트
+## 27. 발표 포인트
 
 ### 시스템 관점
 
 - eBPF program이 syscall tracepoint에 attach된다.
 - kernel space에서는 event 수집만 수행한다.
 - ring buffer를 통해 user-space C engine으로 event를 전달한다.
-- C engine이 rule engine을 통해 alert를 생성한다.
-- Python 분석 계층이 target process와 child process event를 session으로 묶는다.
+- user-space 분석 계층이 target process와 child process를 session으로 묶는다.
 - Python GUI는 privileged engine을 제어하고 report를 시각화한다.
 
 ### 보안 관점
 
-- 이상행위는 악성 확정이 아니라 조사할 가치가 있는 suspicious behavior로 정의한다.
-- `execve` 기반으로 의심 command 실행을 탐지한다.
-- `openat` 기반으로 민감 파일 접근을 탐지한다.
-- AI agent session에서 민감 파일 접근, 위험 명령 실행, 다수 파일 접근을 분석한다.
-- 각 alert는 `severity`, `reason`, `recommendation`을 제공한다.
+- 레포지토리 내부 파일 수정은 정상 개발 활동으로 분류한다.
+- 이상 행위는 악성 확정이 아니라 **검토해야 할 boundary violation**으로 정의한다.
+- `.env`, `.ssh`, `/etc/shadow` 등 Git이 추적하지 않는 로컬 리스크를 감시한다.
+- 각 finding은 `severity`, `reason`, `recommendation`을 포함한다.
 
 ### 제품 관점
 
-- 사용자는 GUI에서 monitoring session을 시작/중지할 수 있다.
+- 사용자는 GUI에서 AI Agent monitoring session을 시작/중지할 수 있다.
 - 각 session은 JSONL log로 저장된다.
-- 저장된 session log는 HTML report로 열람할 수 있다.
-- 단순 event 나열이 아니라 target process의 activity summary를 제공한다.
-- AI agent가 로컬 시스템에서 수행한 작업을 사후 검토할 수 있다.
-- CLI와 GUI를 모두 지원하므로 개발/시연/디버깅이 분리된다.
+- 저장된 session log는 Commit Safety Report로 열람할 수 있다.
+- Report는 syscall log가 아니라 commit 전 검토 가능한 요약 정보를 제공한다.
 
----
-
-## 26. Future Work
+### 차별점 관점
 
 ```text
-BPF map 기반 kernel-side target PID filtering
-connect syscall 기반 outbound network monitoring
-unlinkat/renameat 기반 파일 삭제/rename 탐지
-chmod/fchmodat 기반 권한 변경 탐지
-download-and-shell sequence rule
-process tree correlation 고도화
-allowlist/denylist config
-YAML rule parser
-real-time GUI alert table
-systemd service packaging
-privileged backend + unprivileged GUI 분리
-eBPF LSM 기반 차단 기능
-fanotify 기반 permission prompt
+strace/auditd는 event를 수집한다.
+SysGuard는 AI Agent 작업 맥락에서 event를 해석한다.
+
+Git은 레포지토리 내부 변경을 추적한다.
+SysGuard는 Git이 못 보는 로컬 시스템 경계 위반을 감시한다.
 ```
 
 ---
 
-## 27. 최종 완료 기준
+## 28. Future Work
+
+```text
+kernel-side PID filtering using BPF map
+connect syscall 기반 outbound network monitoring
+unlinkat/renameat 기반 삭제/rename 정확도 향상
+git worktree 기반 safe workspace 생성
+allowlist/denylist config
+YAML policy parser
+real-time GUI alert table
+systemd service packaging
+privileged backend + unprivileged GUI 분리
+eBPF LSM 또는 fanotify 기반 차단 기능
+optional secure backup mode for protected local files
+```
+
+---
+
+## 29. 최종 완료 기준
 
 - clean Ubuntu VM에서 build 가능
-- `make run-fake`로 fake alert 출력 가능
+- `make run-fake`로 fake JSONL 생성 가능
 - `sudo ./build/sysguard`로 real eBPF mode 실행 가능
 - GUI에서 Start/Stop 동작 가능
 - GUI에서 `logs/*.jsonl` session 목록 조회 가능
 - 선택한 log를 HTML report로 열람 가능
 - `execve` event 수집 가능
 - `openat` event 수집 가능
-- `pid`, `ppid`, `uid`, `comm`, `argv`, `path` 기록 가능
-- target process 또는 AI-agent-like process session summary 생성 가능
-- 최소 5개 rule alert 재현 가능
-- JSONL report 생성 가능
-- Agent Session Report 생성 가능
+- 고정 JSONL schema 출력 가능
+- target process 기준 lightweight session filtering 가능
+- project boundary 판단 가능
+- protected path 접근 탐지 가능
+- dangerous command 탐지 가능
+- Commit Safety `SAFE/REVIEW_NEEDED/UNSAFE` 판단 가능
 - demo script로 harmless 시연 가능
 - README만 보고 build/run/demo 재현 가능

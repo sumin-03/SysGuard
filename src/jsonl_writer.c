@@ -1,16 +1,32 @@
 #include "jsonl_writer.h"
+#include <stdio.h>
 #include <string.h>
 
 FILE *jsonl_open(const char *path) {
     return fopen(path, "a");
 }
 
+// JSON string escape. Besides '"' and '\\', control characters (e.g. the
+// newlines in a multi-line `python3 -c ...` argv) must be escaped or the
+// JSONL line breaks apart and the Python analyzer cannot parse the session.
 static void esc(char *dst, size_t sz, const char *src) {
     size_t j = 0;
     if (!src) { dst[0] = '\0'; return; }
-    for (size_t i = 0; src[i] && j < sz - 2; i++) {
-        if (src[i] == '"' || src[i] == '\\') dst[j++] = '\\';
-        dst[j++] = src[i];
+    for (size_t i = 0; src[i] && j + 7 < sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        switch (c) {
+            case '"':  dst[j++] = '\\'; dst[j++] = '"';  break;
+            case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+            case '\n': dst[j++] = '\\'; dst[j++] = 'n';  break;
+            case '\t': dst[j++] = '\\'; dst[j++] = 't';  break;
+            case '\r': dst[j++] = '\\'; dst[j++] = 'r';  break;
+            default:
+                if (c < 0x20) {
+                    j += snprintf(dst + j, sz - j, "\\u%04x", c);
+                } else {
+                    dst[j++] = (char)c;
+                }
+        }
     }
     dst[j] = '\0';
 }
