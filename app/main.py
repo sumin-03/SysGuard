@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SysGuard GUI Wrapper — AI Agent Boundary Auditor."""
+"""SysGuard GUI Wrapper - AI Agent Boundary Auditor."""
 
 import tkinter as tk
 from tkinter import messagebox
@@ -8,9 +8,21 @@ import os
 import glob
 import webbrowser
 import signal
+import getpass
 
 SYSGUARD_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "sysguard")
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+REAL_USER = os.environ.get("SUDO_USER", getpass.getuser())
+REAL_UID = int(os.environ.get("SUDO_UID", os.getuid()))
+REAL_GID = int(os.environ.get("SUDO_GID", os.getgid()))
+
+
+def fix_ownership(path):
+    """Restore file/dir ownership to the real (non-root) user."""
+    try:
+        os.chown(path, REAL_UID, REAL_GID)
+    except OSError:
+        pass
 
 
 class SysGuardApp:
@@ -20,6 +32,7 @@ class SysGuardApp:
         self.root.geometry("680x560")
         self.root.configure(bg="#f0f0f0")
         self.proc = None
+        self.current_log = None
 
         # Header
         hdr = tk.Frame(root, bg="#1a3a5c", pady=10)
@@ -76,6 +89,7 @@ class SysGuardApp:
         self.status.pack(fill=tk.X, side=tk.BOTTOM)
 
         os.makedirs(LOG_DIR, exist_ok=True)
+        fix_ownership(LOG_DIR)
         self.refresh_logs()
 
     def start(self):
@@ -83,6 +97,13 @@ class SysGuardApp:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         target = self.target_var.get().strip() or "claude"
         log_path = os.path.join(LOG_DIR, f"session_{target}_{ts}.jsonl")
+        self.current_log = log_path
+
+        # Pre-create log file with real user ownership
+        with open(log_path, "a") as f:
+            pass
+        fix_ownership(log_path)
+        os.chmod(log_path, 0o644)
 
         args = [SYSGUARD_BIN]
         if self.use_fake.get():
@@ -125,6 +146,13 @@ class SysGuardApp:
         self.proc = None
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
+        # Restore ownership of log file after root process exits
+        if self.current_log and os.path.exists(self.current_log):
+            fix_ownership(self.current_log)
+            try:
+                os.chmod(self.current_log, 0o644)
+            except OSError:
+                pass
         self.status.config(text="Stopped")
         self.refresh_logs()
 
@@ -152,7 +180,11 @@ class SysGuardApp:
                 target_comm=self.target_var.get().strip(),
                 project_path=self.project_var.get().strip(),
             )
-            webbrowser.open(f"file://{os.path.abspath(html_path)}")
+            fix_ownership(html_path)
+            if os.environ.get("SUDO_USER"):
+                    subprocess.Popen(["sudo", "-E", "-u", REAL_USER, "xdg-open", os.path.abspath(html_path)])
+            else:
+                webbrowser.open(f"file://{os.path.abspath(html_path)}")
             self.status.config(text=f"Report: {os.path.basename(html_path)}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
