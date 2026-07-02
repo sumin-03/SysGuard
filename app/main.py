@@ -9,6 +9,7 @@ import glob
 import webbrowser
 import signal
 import getpass
+import pwd
 
 SYSGUARD_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "sysguard")
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
@@ -23,6 +24,56 @@ def fix_ownership(path):
         os.chown(path, REAL_UID, REAL_GID)
     except OSError:
         pass
+
+
+def open_in_browser(path):
+    """Open a file in the real user's browser, even when the GUI runs as root.
+
+    `sudo -E` alone is not enough: it leaks root's HOME/XDG dirs into the
+    child, so gio/dconf break and snap browsers (firefox) are not on sudo's
+    secure PATH. Rebuild the real user's session environment explicitly.
+    """
+    url = f"file://{os.path.abspath(path)}"
+    if not os.environ.get("SUDO_USER"):
+        webbrowser.open(url)
+        return
+
+    info = pwd.getpwnam(REAL_USER)
+    env = {
+        "HOME": info.pw_dir,
+        "USER": REAL_USER,
+        "LOGNAME": REAL_USER,
+        "DISPLAY": os.environ.get("DISPLAY", ":0"),
+        "XDG_RUNTIME_DIR": f"/run/user/{info.pw_uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{info.pw_uid}/bus",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/snap/bin",
+        # Without XDG_DATA_DIRS gio cannot see snap desktop entries
+        # (/var/lib/snapd/desktop), so the firefox_firefox.desktop default
+        # is unresolvable and gio falls back to Text Editor.
+        "XDG_DATA_DIRS": os.environ.get(
+            "XDG_DATA_DIRS",
+            "/usr/share/ubuntu:/usr/share/gnome:/usr/local/share/"
+            ":/usr/share/:/var/lib/snapd/desktop"),
+    }
+    # sudo strips XAUTHORITY / WAYLAND_DISPLAY from the GUI's environment,
+    # so recover them from the real user's runtime dir instead of relying
+    # on passthrough. Without one of these firefox cannot reach the display.
+    run_dir = f"/run/user/{info.pw_uid}"
+    if os.path.exists(f"{run_dir}/wayland-0"):
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+    xauth = os.environ.get("XAUTHORITY")
+    if not xauth:
+        candidates = glob.glob(f"{run_dir}/.mutter-Xwaylandauth.*")
+        xauth = candidates[0] if candidates else None
+    if xauth:
+        env["XAUTHORITY"] = xauth
+    if os.environ.get("XDG_CURRENT_DESKTOP"):
+        env["XDG_CURRENT_DESKTOP"] = os.environ["XDG_CURRENT_DESKTOP"]
+
+    cmd = ["sudo", "-u", REAL_USER, "env"]
+    cmd += [f"{k}={v}" for k, v in env.items()]
+    cmd += ["xdg-open", os.path.abspath(path)]
+    subprocess.Popen(cmd)
 
 
 class SysGuardApp:
@@ -181,10 +232,7 @@ class SysGuardApp:
                 project_path=self.project_var.get().strip(),
             )
             fix_ownership(html_path)
-            if os.environ.get("SUDO_USER"):
-                    subprocess.Popen(["sudo", "-E", "-u", REAL_USER, "xdg-open", os.path.abspath(html_path)])
-            else:
-                webbrowser.open(f"file://{os.path.abspath(html_path)}")
+            open_in_browser(html_path)
             self.status.config(text=f"Report: {os.path.basename(html_path)}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
