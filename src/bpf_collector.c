@@ -111,9 +111,11 @@ static void log_event(const struct sysguard_event *e, void *ctx)
         printf("  [%s] %s — %s\n",
                sysguard_severity_string(alert.severity),
                alert.rule_id, alert.reason);
-        jsonl_write_alert(lc->fp, &ev, &alert);
+        //여기 수정
+        jsonl_write_alert(lc->fp, &ev, &alert, "", "", "");
     } else {
-        jsonl_write_event(lc->fp, &ev);
+        //여기 수정
+        jsonl_write_event(lc->fp, &ev, "", "", "");
     }
     // NOTE: lc->session carries session_id / project_path / target_comm for the
     // A->B JSONL schema. B's reworked jsonl_writer will consume it as a

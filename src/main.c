@@ -95,12 +95,6 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* Generate session_id */
-    char session_id[64];
-    time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
-    strftime(session_id, sizeof(session_id), "session_%Y%m%d_%H%M%S", tm);
-
     printf("========================================\n");
     printf("  SysGuard - AI Agent Boundary Auditor\n");
     printf("========================================\n");

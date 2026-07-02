@@ -23,9 +23,6 @@ struct sysguard_session {
 // the collector entry point can take one without pulling in the full header.
 struct target_filter;
 
-// Fake event generator (owner B): no root/eBPF needed, for demos and testing.
-void fake_collector_run(const char *output_path);
-
 // Real eBPF collector entry point (owner A): load/attach the BPF program, poll
 // the ring buffer, apply the target-subtree filter, and log surviving events
 // through the rule engine + JSONL writer until interrupted. session carries the
