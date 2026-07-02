@@ -3,11 +3,9 @@
 ## Quick Start
 
 ```bash
-# 1. Build the C engine
-make
-
-# 2. Run GUI
-cd app && python3 main.py
+# Run GUI
+in SysGuard
+sudo -E python3 app/main.py
 ```
 
 ## Features
