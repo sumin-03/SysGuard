@@ -22,21 +22,20 @@ typedef __s32 int32_t;
 // Event types shared by eBPF and user-space code.
 // Keep these values synchronized with bpf/sysguard.bpf.c.
 //
-// EXEC and OPEN are the MVP-required types and the only ones the collector
-// emits today. The remaining values are reserved for optional syscalls that
-// land only after execve/openat are stable (see README "Optional Syscall
-// 확장 우선순위"). Reserving the enum now keeps the wire contract stable so
-// adding a syscall later does not renumber existing events.
+// Values 1-7 are all part of the README's 7-tracepoint contract, not optional
+// extras. The collector emits 6 of them today (EXEC, OPEN, UNLINK, RENAME,
+// CHMOD, EXIT). CONNECT stays reserved-but-unemitted because a destination
+// address needs wire fields this struct does not carry yet (Future Work). These
+// numeric values are a stable ABI: never renumber or reorder them, so a rebuilt
+// consumer keeps decoding older/newer producers.
 enum sysguard_event_type {
-    SYSGUARD_EVENT_EXEC = 1,
-    SYSGUARD_EVENT_OPEN = 2,
-
-    // Optional events. Implement only when the MVP is stable.
-    SYSGUARD_EVENT_UNLINK = 3,  // unlinkat / unlink — file deletion (path).
-    SYSGUARD_EVENT_RENAME = 4,  // renameat / renameat2 — old_path + new_path.
-    SYSGUARD_EVENT_CHMOD = 5,   // fchmodat / chmod — path + mode.
-    SYSGUARD_EVENT_CONNECT = 6, // connect — network fields are Future Work.
-    SYSGUARD_EVENT_EXIT = 7,    // exit_group — process/session end marker.
+    SYSGUARD_EVENT_EXEC = 1,     // execve — exe_path + argv.
+    SYSGUARD_EVENT_OPEN = 2,     // openat — path + open(2) flags.
+    SYSGUARD_EVENT_UNLINK = 3,   // unlinkat — file deletion target (path).
+    SYSGUARD_EVENT_RENAME = 4,   // renameat2 — old_path + new_path + flags.
+    SYSGUARD_EVENT_CHMOD = 5,    // fchmodat — path + mode.
+    SYSGUARD_EVENT_CONNECT = 6,  // connect — reserved; address fields TBD.
+    SYSGUARD_EVENT_EXIT = 7,     // exit_group — process/session end marker.
 };
 
 // Normalized event consumed by the rule engine.
@@ -56,7 +55,8 @@ enum sysguard_event_type {
 // representative: comm = caller, exe_path = program.)
 struct sysguard_event {
     uint64_t timestamp_ns;  // CLOCK_MONOTONIC ns (bpf_ktime_get_ns) at entry.
-    uint32_t type;          // enum sysguard_event_type (EXEC / OPEN).
+    uint32_t type;          // enum sysguard_event_type; selects which payload
+                            // fields below are valid.
 
     // Caller process context (the process that made the syscall).
     uint32_t pid;           // Caller TGID (the userspace "PID").
@@ -79,7 +79,8 @@ struct sysguard_event {
                                       // unlink target, chmod target).
     char old_path[SYSGUARD_MAX_PATH]; // Rename source (SYSGUARD_EVENT_RENAME).
     char new_path[SYSGUARD_MAX_PATH]; // Rename dest (SYSGUARD_EVENT_RENAME).
-    int32_t flags;                    // open(2) flags (SYSGUARD_EVENT_OPEN).
+    int32_t flags;                    // open(2) flags (OPEN) or renameat2 flags
+                                      // (RENAME); 0 for other event types.
     int32_t mode;                     // chmod mode bits (SYSGUARD_EVENT_CHMOD).
 };
 

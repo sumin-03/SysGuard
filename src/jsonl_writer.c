@@ -36,7 +36,7 @@ static const char *event_str(uint32_t t) {
         case SYSGUARD_EVENT_EXEC:   return "execve";
         case SYSGUARD_EVENT_OPEN:   return "openat";
         case SYSGUARD_EVENT_UNLINK: return "unlinkat";
-        case SYSGUARD_EVENT_RENAME: return "renameat";
+        case SYSGUARD_EVENT_RENAME: return "renameat2";
         case SYSGUARD_EVENT_CHMOD:  return "fchmodat";
         case SYSGUARD_EVENT_EXIT:   return "exit_group";
         default:                    return "unknown";
@@ -47,24 +47,30 @@ void jsonl_write_event(FILE *fp, const struct sysguard_event *ev,
                         const char *session_id, const char *project_path,
                         const char *target_comm) {
     if (!fp || !ev) return;
-    char c[64], ep[512], av[512], p[512], si[128], pp[512], tc[64];
+    char c[64], ep[512], av[512], p[512], op[512], np[512], si[128], pp[512], tc[64];
     esc(c,  sizeof(c),  ev->comm);
     esc(ep, sizeof(ep), ev->exe_path);
     esc(av, sizeof(av), ev->argv);
     esc(p,  sizeof(p),  ev->path);
+    esc(op, sizeof(op), ev->old_path);
+    esc(np, sizeof(np), ev->new_path);
     esc(si, sizeof(si), session_id);
     esc(pp, sizeof(pp), project_path);
     esc(tc, sizeof(tc), target_comm);
 
+    // old_path/new_path/flags/mode are additive fields: readers that ignore
+    // unknown keys keep working, while rename/chmod/open evidence is preserved.
     fprintf(fp,
         "{\"timestamp_ns\":%llu,\"session_id\":\"%s\","
         "\"event\":\"%s\",\"pid\":%u,\"ppid\":%u,\"uid\":%u,"
         "\"comm\":\"%s\",\"argv\":\"%s\",\"path\":\"%s\","
+        "\"old_path\":\"%s\",\"new_path\":\"%s\",\"flags\":%d,\"mode\":%d,"
         "\"project_path\":\"%s\",\"target_comm\":\"%s\"}\n",
         (unsigned long long)ev->timestamp_ns, si,
         event_str(ev->type), ev->pid, ev->ppid, ev->uid,
         c, ev->type == SYSGUARD_EVENT_EXEC ? av : "",
         ev->type == SYSGUARD_EVENT_OPEN ? p : (ev->type == SYSGUARD_EVENT_EXEC ? ep : p),
+        op, np, ev->flags, ev->mode,
         pp, tc);
     fflush(fp);
 }
@@ -74,7 +80,7 @@ void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
                         const char *session_id, const char *project_path,
                         const char *target_comm) {
     if (!fp || !a) return;
-    char c[64], ri[128], re[512], rc[512], ep[512], p[512], av[512];
+    char c[64], ri[128], re[512], rc[512], ep[512], p[512], av[512], op[512], np[512];
     char si[128], pp[512], tc[64];
     esc(c,  sizeof(c),  a->comm);
     esc(ri, sizeof(ri), a->rule_id);
@@ -83,24 +89,31 @@ void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
     esc(si, sizeof(si), session_id);
     esc(pp, sizeof(pp), project_path);
     esc(tc, sizeof(tc), target_comm);
-    ep[0] = p[0] = av[0] = '\0';
+    ep[0] = p[0] = av[0] = op[0] = np[0] = '\0';
     if (ev) {
         esc(ep, sizeof(ep), ev->exe_path);
         esc(p,  sizeof(p),  ev->path);
         esc(av, sizeof(av), ev->argv);
+        esc(op, sizeof(op), ev->old_path);
+        esc(np, sizeof(np), ev->new_path);
     }
 
+    // Same syscall payload fields as jsonl_write_event so alert and non-alert
+    // records stay structurally consistent.
     fprintf(fp,
         "{\"timestamp_ns\":%llu,\"session_id\":\"%s\","
         "\"event\":\"%s\",\"pid\":%u,\"ppid\":%u,\"uid\":%u,"
         "\"comm\":\"%s\",\"argv\":\"%s\",\"path\":\"%s\","
+        "\"old_path\":\"%s\",\"new_path\":\"%s\",\"flags\":%d,\"mode\":%d,"
         "\"project_path\":\"%s\",\"target_comm\":\"%s\","
         "\"alert\":true,\"rule_id\":\"%s\",\"severity\":\"%s\","
         "\"reason\":\"%s\",\"recommendation\":\"%s\"}\n",
         (unsigned long long)a->timestamp_ns, si,
         ev ? event_str(ev->type) : "unknown",
         a->pid, a->ppid, a->uid, c,
-        ev ? av : "", ev ? p : "",
+        ev && ev->type == SYSGUARD_EVENT_EXEC ? av : "",
+        ev && ev->type == SYSGUARD_EVENT_EXEC ? ep : p,
+        op, np, ev ? ev->flags : 0, ev ? ev->mode : 0,
         pp, tc,
         ri, sysguard_severity_string(a->severity), re, rc);
     fflush(fp);

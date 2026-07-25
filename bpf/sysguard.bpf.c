@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 // SysGuard eBPF collector.
 //
-// Attaches to the execve and openat syscall tracepoints and pushes a normalized
-// sysguard_event into a BPF ring buffer for the user-space engine. execve
-// carries exe_path + argv; openat carries the target path + open(2) flags.
+// Attaches to syscall tracepoints and pushes a normalized sysguard_event into a
+// BPF ring buffer for the user-space engine. Implemented tracepoints:
+//   execve     -> exe_path + argv
+//   openat     -> path + open(2) flags
+//   unlinkat   -> path (deletion target)
+//   renameat2  -> old_path + new_path + rename flags
+//   fchmodat   -> path + mode
+//   exit_group -> process context only (session/subtree end marker)
+// (connect is the remaining README tracepoint; it needs address fields the wire
+// struct does not carry yet, so it is deferred.)
 // Collection only — no filtering or verdicts in kernel space; user-space picks
 // the target process and the rule engine decides what is suspicious.
 #include "vmlinux.h"
@@ -146,6 +153,103 @@ int handle_openat(struct trace_event_raw_sys_enter *ctx)
     const char *filename = (const char *)ctx->args[1];
     bpf_probe_read_user_str(&e->path, sizeof(e->path), filename);
     e->flags = (int32_t)ctx->args[2];
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// unlinkat(int dfd, const char *pathname, int flag). We record the deletion
+// target path (args[1]); the AT_REMOVEDIR flag is not carried in the wire
+// struct. Like openat this fires at syscall entry, so it records an *attempt*.
+SEC("tracepoint/syscalls/sys_enter_unlinkat")
+int handle_unlinkat(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_UNLINK;
+
+    const char *pathname = (const char *)ctx->args[1];
+    bpf_probe_read_user_str(&e->path, sizeof(e->path), pathname);
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// renameat2(int olddfd, const char *oldname, int newdfd, const char *newname,
+// unsigned int flags). Note the interleaved dir-fd args: the source path is
+// args[1] and the destination path is args[3] (args[2] is newdfd, NOT a path).
+// old_path and new_path get independent bounded reads into their own buffers.
+SEC("tracepoint/syscalls/sys_enter_renameat2")
+int handle_renameat2(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_RENAME;
+
+    const char *oldname = (const char *)ctx->args[1];
+    const char *newname = (const char *)ctx->args[3];
+    bpf_probe_read_user_str(&e->old_path, sizeof(e->old_path), oldname);
+    bpf_probe_read_user_str(&e->new_path, sizeof(e->new_path), newname);
+    e->flags = (int32_t)ctx->args[4];
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// fchmodat(int dfd, const char *filename, umode_t mode). We record the target
+// path (args[1]) and the requested mode bits (args[2]); rule matching compares
+// permission bits (e.g. world-writable), not any decimal rendering.
+SEC("tracepoint/syscalls/sys_enter_fchmodat")
+int handle_fchmodat(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_CHMOD;
+
+    const char *pathname = (const char *)ctx->args[1];
+    bpf_probe_read_user_str(&e->path, sizeof(e->path), pathname);
+    e->mode = (int32_t)ctx->args[2];
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// exit_group(int error_code): the whole thread group is exiting. We emit a
+// payload-free marker carrying only process context so user-space can retire a
+// tracked PID / mark the session end. The exit status (args[0]) is intentionally
+// not stored — the wire struct reserves no field for it.
+SEC("tracepoint/syscalls/sys_enter_exit_group")
+int handle_exit_group(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    (void)ctx;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_EXIT;
 
     bpf_ringbuf_submit(e, 0);
     return 0;

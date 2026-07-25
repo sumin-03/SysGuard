@@ -26,25 +26,48 @@ static void on_signal(int sig)
 static const char *event_type_str(uint32_t type)
 {
     switch (type) {
-    case SYSGUARD_EVENT_EXEC: return "EXEC";
-    case SYSGUARD_EVENT_OPEN: return "OPEN";
-    default:                  return "UNKNOWN";
+    case SYSGUARD_EVENT_EXEC:   return "EXEC";
+    case SYSGUARD_EVENT_OPEN:   return "OPEN";
+    case SYSGUARD_EVENT_UNLINK: return "UNLINK";
+    case SYSGUARD_EVENT_RENAME: return "RENAME";
+    case SYSGUARD_EVENT_CHMOD:  return "CHMOD";
+    case SYSGUARD_EVENT_EXIT:   return "EXIT";
+    default:                    return "UNKNOWN";
     }
 }
 
 static void print_event(const struct sysguard_event *e, void *ctx)
 {
     (void)ctx;
-    // OPEN events carry the target path (exe_path/argv are empty); EXEC events
-    // carry the program path + argv (path is empty). Print the fields that are
-    // actually populated for each type so openat shows its file path.
-    if (e->type == SYSGUARD_EVENT_OPEN) {
-        printf("[OPEN] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s path=%s\n",
-               e->pid, e->ppid, e->uid, e->comm, e->path);
-    } else {
-        printf("[%-4s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s exe=%s argv=[%s]\n",
-               event_type_str(e->type), e->pid, e->ppid, e->uid,
+    // Print only the fields each event type actually populates: EXEC carries the
+    // program path + argv; the file syscalls carry path(s)/mode/flags; EXIT is a
+    // context-only marker.
+    const char *common = event_type_str(e->type);
+    switch (e->type) {
+    case SYSGUARD_EVENT_OPEN:
+    case SYSGUARD_EVENT_UNLINK:
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s path=%s\n",
+               common, e->pid, e->ppid, e->uid, e->comm, e->path);
+        break;
+    case SYSGUARD_EVENT_RENAME:
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s old=%s new=%s flags=%d\n",
+               common, e->pid, e->ppid, e->uid, e->comm,
+               e->old_path, e->new_path, e->flags);
+        break;
+    case SYSGUARD_EVENT_CHMOD:
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s path=%s mode=%o\n",
+               common, e->pid, e->ppid, e->uid, e->comm,
+               e->path, (unsigned int)(e->mode & 07777));
+        break;
+    case SYSGUARD_EVENT_EXIT:
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s\n",
+               common, e->pid, e->ppid, e->uid, e->comm);
+        break;
+    default:  /* EXEC and anything unexpected */
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s exe=%s argv=[%s]\n",
+               common, e->pid, e->ppid, e->uid,
                e->comm, e->exe_path, e->argv);
+        break;
     }
     fflush(stdout);
 }

@@ -44,17 +44,18 @@ static const char *basename_of(const char *path)
     return slash ? slash + 1 : path;
 }
 
-// Resolve a relative openat path against the process's live cwd. Leaves the
-// path untouched if it is empty, already absolute, or the process is gone.
-// Note: openat relative to a dirfd other than AT_FDCWD is not handled (the
+// Resolve one relative path field (SYSGUARD_MAX_PATH bytes) against the given
+// process's live cwd. Leaves the field untouched if it is empty, already
+// absolute, or the process is gone.
+// Note: a path relative to a dirfd other than AT_FDCWD is not handled (the
 // dirfd is not captured); MVP assumes cwd-relative paths.
-static void absolutize_path(struct sysguard_event *e)
+static void absolutize_field(uint32_t pid, char *field)
 {
-    if (e->path[0] == '\0' || e->path[0] == '/')
+    if (field[0] == '\0' || field[0] == '/')
         return;
 
     char link[64];
-    snprintf(link, sizeof(link), "/proc/%u/cwd", e->pid);
+    snprintf(link, sizeof(link), "/proc/%u/cwd", pid);
 
     char cwd[PATH_MAX];
     ssize_t n = readlink(link, cwd, sizeof(cwd) - 1);
@@ -65,10 +66,29 @@ static void absolutize_path(struct sysguard_event *e)
     // Sized to hold cwd + '/' + path + NUL without truncation; the result is
     // then copied back into the fixed-size event field (truncated if needed).
     char joined[PATH_MAX + SYSGUARD_MAX_PATH];
-    snprintf(joined, sizeof(joined), "%s/%s", cwd, e->path);
+    snprintf(joined, sizeof(joined), "%s/%s", cwd, field);
 
-    strncpy(e->path, joined, SYSGUARD_MAX_PATH - 1);
-    e->path[SYSGUARD_MAX_PATH - 1] = '\0';
+    strncpy(field, joined, SYSGUARD_MAX_PATH - 1);
+    field[SYSGUARD_MAX_PATH - 1] = '\0';
+}
+
+// Normalize whichever path field(s) the event type actually carries. EXEC and
+// EXIT hold no relative file path, so they are left alone.
+static void absolutize_event_paths(struct sysguard_event *e)
+{
+    switch (e->type) {
+    case SYSGUARD_EVENT_OPEN:
+    case SYSGUARD_EVENT_UNLINK:
+    case SYSGUARD_EVENT_CHMOD:
+        absolutize_field(e->pid, e->path);
+        break;
+    case SYSGUARD_EVENT_RENAME:
+        absolutize_field(e->pid, e->old_path);
+        absolutize_field(e->pid, e->new_path);
+        break;
+    default:
+        break;  // EXEC / EXIT: nothing to normalize.
+    }
 }
 
 struct target_filter *target_filter_new(const char *target_comm, uint32_t target_pid)
@@ -100,7 +120,7 @@ void target_filter_free(struct target_filter *tf)
 int target_filter_process(struct target_filter *tf, struct sysguard_event *e)
 {
     if (!tf || !tf->active) {
-        absolutize_path(e);
+        absolutize_event_paths(e);
         return 1;  // Pass-through.
     }
 
@@ -121,6 +141,6 @@ int target_filter_process(struct target_filter *tf, struct sysguard_event *e)
     if (!contains(tf, e->pid))
         return 0;
 
-    absolutize_path(e);
+    absolutize_event_paths(e);
     return 1;
 }
