@@ -22,6 +22,38 @@ SEV_COLORS = {
 }
 
 
+def format_event_detail(ev: dict) -> str:
+    """Event-aware, human-readable detail for one event.
+
+    Returns RAW text — every caller must html.escape() the result. Covers all
+    six event types the C engine emits so rename/chmod/unlink/exit rows are
+    never blank (renameat2 leaves `path` empty by design).
+    """
+    etype = ev.get("event", "")
+    if etype == "execve":
+        return ev.get("argv", "") or ev.get("path", "")
+    if etype == "openat":
+        return ev.get("path", "")
+    if etype == "unlinkat":
+        return f"delete: {ev.get('path', '')}"
+    if etype == "renameat2":
+        old = ev.get("old_path", "")
+        new = ev.get("new_path", "")
+        s = f"{old} → {new}"
+        if ev.get("flags", 0):
+            s += f" (flags {ev.get('flags')})"
+        return s
+    if etype == "fchmodat":
+        try:
+            mode = int(ev.get("mode", 0) or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        return f"{ev.get('path', '')} mode {mode & 0o7777:04o}"
+    if etype == "exit_group":
+        return f"pid {ev.get('pid', '')} ({ev.get('comm', '')}) exited"
+    return ev.get("path", "") or ev.get("argv", "") or etype
+
+
 def generate_report(jsonl_path: str, target_comm: str = "", project_path: str = "") -> str:
     html_path = jsonl_path.replace(".jsonl", ".html")
 
@@ -90,6 +122,10 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
 <tr><td class="label">Alerts</td><td>{safety["alert_count"]}</td></tr>
 <tr><td class="label">Commands Executed</td><td>{len(summary["commands_executed"])}</td></tr>
 <tr><td class="label">Files Accessed</td><td>{len(summary["files_accessed"])}</td></tr>
+<tr><td class="label">Deleted</td><td>{len(summary["files_deleted"])}</td></tr>
+<tr><td class="label">Renamed</td><td>{len(summary["files_renamed"])}</td></tr>
+<tr><td class="label">Permission Changes</td><td>{len(summary["permission_changes"])}</td></tr>
+<tr><td class="label">Process Exits</td><td>{len(summary["process_exits"])}</td></tr>
 </table>
 </div>
 """
@@ -108,7 +144,34 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         for f in normal_files[:20]:
             h += f"  <li>{html.escape(f)}</li>\n"
         h += "</ul>\n"
-    if not normal_cmds and not normal_files:
+    # File-mutation evidence that did not raise an alert (renames, safe chmods,
+    # exits, and any non-alerting deletion) — event-aware so nothing is blank.
+    normal_renames = [e for e in events if e.get("event") == "renameat2" and not e.get("alert")]
+    normal_chmods  = [e for e in events if e.get("event") == "fchmodat" and not e.get("alert")]
+    normal_deletes = [e for e in events if e.get("event") == "unlinkat" and not e.get("alert")]
+    exits          = [e for e in events if e.get("event") == "exit_group"]
+    if normal_deletes:
+        h += "<p><b>Deletions:</b></p><ul>\n"
+        for e in normal_deletes[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        h += "</ul>\n"
+    if normal_renames:
+        h += "<p><b>Renames:</b></p><ul>\n"
+        for e in normal_renames[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        h += "</ul>\n"
+    if normal_chmods:
+        h += "<p><b>Permission changes:</b></p><ul>\n"
+        for e in normal_chmods[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        h += "</ul>\n"
+    if exits:
+        h += "<p><b>Process exits:</b></p><ul>\n"
+        for e in exits[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        h += "</ul>\n"
+    if not (normal_cmds or normal_files or normal_renames
+            or normal_chmods or normal_deletes or exits):
         h += "<p>No normal activity recorded.</p>\n"
     h += "</div>\n"
 
@@ -126,10 +189,39 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
         h += "</ul></div>\n"
 
+    # Suspicious sequences (possible secret exfiltration) — CRITICAL. This is a
+    # Python-only finding, so it will not appear in the C Alert Details table;
+    # surface it explicitly here.
+    if safety.get("suspicious_sequences"):
+        h += '<div class="section"><h2>&#128680; Suspicious Sequences</h2><ul>\n'
+        for f in safety["suspicious_sequences"]:
+            sc = SEV_COLORS.get(f.get("severity", ""), "#666")
+            h += (f'  <li><span class="sev" style="background:{sc}">'
+                  f'{html.escape(f.get("severity", ""))}</span> '
+                  f'{html.escape(f.get("rule_id", ""))} — '
+                  f'{html.escape(f.get("detail", ""))} '
+                  f'(tool: {html.escape(f.get("tool", ""))}, '
+                  f'path: {html.escape(f.get("path", ""))})</li>\n')
+        h += "</ul></div>\n"
+
     # Dangerous commands
     if safety["dangerous_commands"]:
         h += '<div class="section"><h2>&#9888;&#65039; Dangerous Commands</h2><ul>\n'
         for f in safety["dangerous_commands"]:
+            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+        h += "</ul></div>\n"
+
+    # Unsafe permission changes (world-writable fchmodat)
+    if safety.get("unsafe_permission_changes"):
+        h += '<div class="section"><h2>&#128275; Unsafe Permission Changes</h2><ul>\n'
+        for f in safety["unsafe_permission_changes"]:
+            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+        h += "</ul></div>\n"
+
+    # File deletions (review signal)
+    if safety.get("file_deletions"):
+        h += '<div class="section"><h2>&#128465;&#65039; File Deletions</h2><ul>\n'
+        for f in safety["file_deletions"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
         h += "</ul></div>\n"
 
@@ -147,7 +239,7 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         for a in alerts:
             sev = a.get("severity", "")
             sc = SEV_COLORS.get(sev, "#666")
-            detail = a.get("path","") or a.get("argv","")
+            detail = format_event_detail(a)
             h += (f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
                   f"<td>{html.escape(a.get('rule_id',''))}</td>"
                   f"<td>{a.get('pid','')}</td>"

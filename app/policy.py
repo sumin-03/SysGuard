@@ -10,14 +10,23 @@ PROTECTED_PATHS = [
     "/etc/shadow", "/etc/sudoers",
 ]
 
+# Destructive commands that each independently force an UNSAFE verdict. Aligned
+# with the README/C canonical rules (destructive-rm, git-reset-hard,
+# git-clean-force, unsafe-chmod).
+#
+# Deliberately NOT here:
+#   curl / wget  -> downloader-exec (MEDIUM in the C engine); a standalone
+#                   download is not UNSAFE on its own. It escalates only via the
+#                   .env-then-transfer sequence (possible-secret-exfiltration,
+#                   see detect_suspicious_sequences).
+#   chown root   -> non-canonical (unsafe-chown), dropped from the C engine in
+#                   TASK-A-003.
+#   nc/netcat/ncat -> non-canonical (suspicious-netcat), dropped in TASK-A-003.
 DANGEROUS_COMMANDS = [
     "rm -rf", "rm -r",
     "git reset --hard",
     "git clean -fd", "git clean -f",
     "chmod 777", "chmod a+rwx",
-    "chown root",
-    "curl", "wget",
-    "nc", "netcat", "ncat",
 ]
 
 TARGET_PROCESSES = ["claude", "codex", "gemini", "cursor", "code"]
@@ -86,8 +95,79 @@ def is_boundary_violation(path: str, project_path: str) -> bool:
     return not is_inside_project(path, project_path)
 
 
+def is_env_file_path(path: str) -> bool:
+    """True only for dotenv-family secret files (.env, .env.local, ...).
+
+    Deliberately narrower than is_protected_path: the exfiltration precursor is
+    specifically a .env file, not SSH/AWS/shadow. `foo.env` and `.environment`
+    do NOT qualify.
+    """
+    if not path:
+        return False
+    base = os.path.basename(path)
+    return base == ".env" or base.startswith(".env.")
+
+
+def external_transfer_tool(event: dict):
+    """Return 'curl'/'wget' if this execve runs an external-transfer tool, else None.
+
+    Matches the executable basename exactly (falling back to the first argv
+    token when path is empty) so `curl-helper`, `mywget`, or a URL substring do
+    not match.
+    """
+    if event.get("event") != "execve":
+        return None
+    path = event.get("path", "")
+    if path:
+        name = os.path.basename(path)
+    else:
+        # `.get("argv", "")` is not enough: an explicit JSON null returns None
+        # (the default only applies when the key is absent), and None.split()
+        # would raise. Normalize null the same as missing.
+        tokens = (event.get("argv") or "").split()
+        name = os.path.basename(tokens[0]) if tokens else ""
+    return name if name in ("curl", "wget") else None
+
+
+def detect_suspicious_sequences(events: list) -> list:
+    """Detect '.env access then curl/wget execution' within one ordered session.
+
+    Single forward scan: remember the first `.env` openat, then on the first
+    later curl/wget execve emit exactly one CRITICAL finding and stop. Order
+    matters — a transfer before any `.env` access does not trigger. No PID
+    matching (the shell and the child tool have different PIDs). All state is
+    local to this call, so separate sessions never share sequence state.
+
+    Only the access *fact* is recorded — never secret contents.
+    """
+    env_path = None
+    for ev in events:
+        if env_path is None and ev.get("event") == "openat" \
+                and is_env_file_path(ev.get("path", "")):
+            env_path = ev.get("path", "")
+            continue
+        if env_path is not None:
+            tool = external_transfer_tool(ev)
+            if tool:
+                return [{
+                    "type": "suspicious_sequence",
+                    "rule_id": "possible-secret-exfiltration",
+                    "severity": "critical",
+                    "path": env_path,
+                    "tool": tool,
+                    "detail": f".env access ({env_path}) followed by {tool} execution",
+                }]
+    return []
+
+
 def classify_event(event: dict) -> dict:
-    """Classify a single JSONL event and return findings."""
+    """Classify a single JSONL event and return findings.
+
+    Events are captured at syscall *entry*, so mutation events (unlinkat,
+    fchmodat) describe requested actions, not confirmed results. renameat2 and
+    exit_group carry no independent safety finding here (rename is tracked as
+    evidence; exit is lifecycle only).
+    """
     findings = []
     path = event.get("path", "")
     argv = event.get("argv", "")
@@ -116,6 +196,27 @@ def classify_event(event: dict) -> dict:
                 "detail": f"Dangerous command: {argv}",
             })
 
+    if ev_type == "unlinkat" and path:
+        # A deletion was requested. On its own this is a review signal, not an
+        # automatic UNSAFE — see evaluate_commit_safety.
+        findings.append({
+            "type": "file_deletion",
+            "severity": "medium",
+            "detail": f"File deletion requested: {path}",
+        })
+
+    if ev_type == "fchmodat":
+        try:
+            mode = int(event.get("mode", 0) or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        if mode & 0o002:  # world-writable
+            findings.append({
+                "type": "permission_change",
+                "severity": "high",
+                "detail": f"World-writable permission set: {path} mode {mode & 0o7777:04o}",
+            })
+
     return {
         "event": event,
         "findings": findings,
@@ -128,6 +229,8 @@ def evaluate_commit_safety(events: list, project_path: str = "") -> dict:
     protected_accesses = []
     boundary_violations = []
     dangerous_commands = []
+    file_deletions = []
+    unsafe_permission_changes = []
     normal_activities = []
 
     for ev in events:
@@ -140,9 +243,16 @@ def evaluate_commit_safety(events: list, project_path: str = "") -> dict:
                 boundary_violations.append(f)
             elif f["type"] == "dangerous_command":
                 dangerous_commands.append(f)
+            elif f["type"] == "file_deletion":
+                file_deletions.append(f)
+            elif f["type"] == "permission_change":
+                unsafe_permission_changes.append(f)
 
         if not result["findings"]:
             normal_activities.append(ev)
+
+    # Ordered, session-scoped sequence detection (.env access -> curl/wget).
+    suspicious_sequences = detect_suspicious_sequences(events)
 
     # Determine safety
     has_critical = any(
@@ -152,14 +262,22 @@ def evaluate_commit_safety(events: list, project_path: str = "") -> dict:
     has_ssh = any(".ssh" in f["detail"] for f in protected_accesses)
     has_shadow = any("/etc/shadow" in f["detail"] for f in protected_accesses)
 
-    if has_critical or has_env or has_ssh or has_shadow or boundary_violations or dangerous_commands:
+    if (has_critical or has_env or has_ssh or has_shadow
+            or boundary_violations or dangerous_commands
+            or unsafe_permission_changes or suspicious_sequences):
         safety = "UNSAFE"
-    elif len(all_findings) > 0:
+    elif file_deletions or len(all_findings) > 0:
+        # A deletion (or any other non-UNSAFE finding) warrants a look but is not
+        # on its own an UNSAFE verdict. Broader REVIEW_NEEDED heuristics: B-003.
         safety = "REVIEW_NEEDED"
     else:
         safety = "SAFE"
 
     recommendations = []
+    if suspicious_sequences:
+        recommendations.append(
+            "Stop the commit, review the transfer command, and rotate credentials "
+            "if secret exposure is possible.")
     if has_env:
         recommendations.append("Review whether .env secrets were exposed. Rotate API keys if needed.")
     if has_ssh:
@@ -170,6 +288,10 @@ def evaluate_commit_safety(events: list, project_path: str = "") -> dict:
         recommendations.append("Review git reflog and verify destructive commands were intentional.")
     if boundary_violations:
         recommendations.append("Investigate file access outside project boundary.")
+    if unsafe_permission_changes:
+        recommendations.append("Restrict world-writable permissions to the minimum required.")
+    if file_deletions:
+        recommendations.append("Review deleted files. Check git status for anything unexpectedly removed.")
     if not recommendations:
         recommendations.append("No issues detected. Safe to commit.")
 
@@ -181,5 +303,8 @@ def evaluate_commit_safety(events: list, project_path: str = "") -> dict:
         "protected_accesses": protected_accesses,
         "boundary_violations": boundary_violations,
         "dangerous_commands": dangerous_commands,
+        "file_deletions": file_deletions,
+        "unsafe_permission_changes": unsafe_permission_changes,
+        "suspicious_sequences": suspicious_sequences,
         "recommendations": recommendations,
     }
