@@ -39,17 +39,57 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-002 | P1 | **DONE** | Add session-scoped `possible-secret-exfiltration` detection (`.env` access followed by `curl`/`wget`) in the Python policy. |
 | TASK-B-003 | P1 | **DONE** | Implement README-conformant `REVIEW_NEEDED` decisions (high-volume changes, build/config edits, sandbox-only deletions). |
 | TASK-B-004 | P2 | **DONE** | Reconcile Python `DANGEROUS_COMMANDS` with the canonical README/C rules — drop `chown root`/`nc`/`netcat`/`ncat`; treat standalone `curl`/`wget` as downloader evidence, not an UNSAFE command. |
-| TASK-B-005 | P2 | DEPENDS-ON:TASK-B-001 | Complete report conformance: add "Recent Events", correct the 10-section order, render every event payload meaningfully. |
+| TASK-B-005 | P2 | **DONE** | Complete report conformance: add "Recent Events", correct the 10-section order, render every event payload meaningfully. |
 | TASK-B-006 | P1 | **DONE** | Add a non-sudo Python test suite (policy, sequence ordering, event-contract compatibility, safety verdicts, HTML escaping, report sections). Independent of TASK-A-008. |
 | TASK-B-007 | P2 | DEPENDS-ON:TASK-B-003 | Add the README-promised per-session safety-result preview to the GUI session list/panel. |
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 
-**Next up (highest-priority READY):** TASK-B-005 (report Recent Events + section order — unblocked by B-001) / TASK-B-007 (GUI safety preview — unblocked by B-003). All P1 tasks are now DONE or DEFERRED/BLOCKED.
+**Next up:** TASK-A-002 (design the CONNECT address ABI to unblock `outbound-connect` → 13/13 canonical rules) is the natural finish line but requires the first-ever shared-ABI change; remaining READY infra tasks are TASK-B-007 (GUI preview), TASK-A-008 (C tests), TASK-A-010 (Makefile), TASK-A-011 (EXIT-based PID retirement), TASK-B-008/B-009.
 
 ---
 
 ## Completed
+
+### TASK-B-005 — HTML report README section-9 conformance
+*Completed 2026-07-25.*
+
+Brought the report to the exact 10-section order README section 9 specifies and
+added the missing "Recent Events" section.
+
+**File changed (1 + tests):** `app/report.py` (+ `tests/test_report.py`).
+- **Canonical order** (1) Session Metadata → (2) Commit Safety badge → (3) Normal
+  Development Activity → (4) Boundary Violations → (5) Protected Path Access →
+  (6) Dangerous Commands → (7) Git Status/Diff Summary → (8) Alert Details →
+  (9) Recent Events → (10) Recommended Actions. Metadata now precedes the badge
+  (was reversed) and carries a heading for stable order assertions.
+- **Stable layout:** Boundary Violations / Protected Path Access / Dangerous
+  Commands / Alert Details always render, with concise empty-state text, so the
+  ten-section structure does not vary by session.
+- **Findings as subsections:** the B-002 Suspicious Sequences, B-001 Unsafe
+  Permission Changes + File Deletions, and B-003 Review Needed displays moved to
+  `<h3>` subsections under Alert Details (kept their evidence + headings) instead
+  of interrupting README's ten top-level sections. Alert Details renders even
+  with no C alert (Python findings can carry the verdict).
+- **Recent Events:** the last 50 filtered events, newest-first
+  (`events[-50:][::-1]`), each rendered through `format_event_detail` so all six
+  event types show meaningful payloads; the cap/count are labeled.
+- Every event-derived value (event type, comm, pid via `str()`, detail, finding
+  text, git status/diff) is `html.escape`d — the XSS invariant is preserved.
+
+**Do-not-touch honored:** no C/BPF/JSONL change; `app/main.py`,
+`app/policy.py`, `app/session_analyzer.py`, `app/git_summary.py` unchanged; no
+verdict/classification change; no new analyzer aggregation.
+
+**Verification (all non-sudo):** `py_compile` OK; full suite **61 tests** (was
+54, +7: order, metadata-before-badge, empty states, Recent Events renders every
+event type, 50-cap newest-first, findings-as-subsections, hostile escaping); a
+live fake-mode report renders all 10 sections in the canonical order with the
+finding subsections between Alert Details and Recent Events.
+
+**Director review:** Codex reviewed the 2-file diff — APPROVED, no findings.
+
+
 
 ### TASK-A-007 — Fake-collector rule coverage (git-clean-force)
 *Completed 2026-07-25.*

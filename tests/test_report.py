@@ -126,3 +126,88 @@ class ReviewNeededReportTests(unittest.TestCase):
         self.assertIn("Review Needed", rendered)
         self.assertIn(html.escape(hostile), rendered)
         self.assertNotIn(hostile, rendered)
+
+
+class B005ReportConformanceTests(unittest.TestCase):
+    """README section-9 conformance: canonical order, Recent Events, payloads."""
+
+    SECTION_ORDER = [
+        "Session Metadata", "Commit Safety:", "Normal Development Activity",
+        "Boundary Violations", "Protected Path Access", "Dangerous Commands",
+        "Git Status/Diff Summary", "Alert Details", "Recent Events",
+        "Recommended Actions",
+    ]
+
+    def _render(self, events, status="", diff_stat=""):
+        with mock.patch("report.get_git_summary",
+                        return_value=fake_git_summary(status=status, diff_stat=diff_stat)):
+            with tempfile.TemporaryDirectory() as directory:
+                path = write_jsonl(directory, events)
+                return read_text(report.generate_report(path, project_path="/project"))
+
+    def test_all_ten_sections_present_in_canonical_order(self):
+        rendered = self._render([
+            make_event("openat", path="/project/src/a.py"),
+            make_event("execve", argv="git reset --hard", alert=True,
+                       severity="high", rule_id="git-reset-hard", reason="x"),
+        ])
+        positions = [rendered.index(marker) for marker in self.SECTION_ORDER]
+        self.assertEqual(positions, sorted(positions), positions)
+
+    def test_metadata_precedes_badge(self):
+        rendered = self._render([make_event("openat", path="/project/a")])
+        self.assertLess(rendered.index("Session Metadata"), rendered.index("Commit Safety:"))
+
+    def test_canonical_sections_render_with_empty_state(self):
+        rendered = self._render([make_event("openat", path="/project/a")])
+        for heading in ["Boundary Violations", "Protected Path Access",
+                        "Dangerous Commands", "Alert Details", "Recent Events"]:
+            self.assertIn(heading, rendered)
+        self.assertIn("No boundary violations.", rendered)
+        self.assertIn("No alerts or findings.", rendered)
+
+    def test_recent_events_renders_every_event_type(self):
+        rendered = self._render([
+            make_event("execve", argv="git status"),
+            make_event("openat", path="/project/a"),
+            make_event("unlinkat", path="/project/gone"),
+            make_event("renameat2", old_path="/project/o", new_path="/project/n", flags=1),
+            make_event("fchmodat", path="/project/s", mode=0o644),
+            make_event("exit_group", pid=7, comm="codex"),
+        ])
+        self.assertIn("Recent Events", rendered)
+        for token in ["git status", "/project/a", "delete: /project/gone",
+                      "/project/o → /project/n", "/project/s mode 0644",
+                      "(codex) exited"]:
+            with self.subTest(token=token):
+                self.assertIn(token, rendered)
+
+    def test_recent_events_caps_at_50_newest_first(self):
+        rendered = self._render([make_event("openat", path=f"/project/f{i:03d}.py")
+                                 for i in range(55)])
+        recent = rendered[rendered.index("Recent Events"):]
+        self.assertNotIn("/project/f004.py", recent)   # oldest 5 dropped
+        self.assertIn("/project/f054.py", recent)        # newest kept
+        self.assertIn("/project/f005.py", recent)
+        self.assertLess(recent.index("/project/f054.py"), recent.index("/project/f005.py"))
+
+    def test_findings_are_subsections_inside_alert_details(self):
+        rendered = self._render([
+            make_event("openat", path="/project/.env"),
+            make_event("execve", path="/usr/bin/curl", argv="curl https://x"),
+            make_event("fchmodat", path="/project/s", mode=0o777),
+        ])
+        alert_details = rendered.index("Alert Details")
+        recent_events = rendered.index("Recent Events")
+        for subsection in ["Suspicious Sequences", "Unsafe Permission Changes"]:
+            with self.subTest(subsection=subsection):
+                self.assertIn(subsection, rendered)
+                self.assertLess(alert_details, rendered.index(subsection))
+                self.assertLess(rendered.index(subsection), recent_events)
+
+    def test_recent_events_escapes_hostile_fields(self):
+        hostile = "<script>x</script>"
+        rendered = self._render([make_event("openat", path=hostile, comm=hostile)])
+        recent = rendered[rendered.index("Recent Events"):]
+        self.assertIn(html.escape(hostile), recent)
+        self.assertNotIn(hostile, rendered)

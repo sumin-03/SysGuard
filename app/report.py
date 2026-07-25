@@ -96,6 +96,8 @@ h1 {{ color: #1a3a5c; font-size: 1.8rem; margin-bottom: 0.3rem; }}
   box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
 .section h2 {{ color: #1a3a5c; font-size: 1.1rem; margin-bottom: 0.7rem;
   border-bottom: 2px solid #e9ecef; padding-bottom: 0.4rem; }}
+.section h3 {{ color: #1a3a5c; font-size: 0.95rem; margin: 0.9rem 0 0.4rem; }}
+.empty {{ color: #888; font-style: italic; }}
 ul {{ padding-left: 1.2rem; }}
 li {{ margin-bottom: 0.3rem; }}
 table {{ border-collapse: collapse; width: 100%; margin-top: 0.5rem; }}
@@ -113,9 +115,7 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
 <h1>&#128737; SysGuard Commit Safety Report</h1>
 <p class="subtitle">AI Agent Boundary Auditor</p>
 
-<div class="safety-badge">Commit Safety: {safety["safety"]}</div>
-
-<div class="meta">
+<div class="section meta"><h2>&#128203; Session Metadata</h2>
 <table>
 <tr><td class="label">Session</td><td>{html.escape(session_id)}</td></tr>
 <tr><td class="label">Target Agent</td><td>{html.escape(target_comm or "(all)")}</td></tr>
@@ -130,6 +130,8 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
 <tr><td class="label">Process Exits</td><td>{len(summary["process_exits"])}</td></tr>
 </table>
 </div>
+
+<div class="safety-badge">Commit Safety: {html.escape(safety["safety"])}</div>
 """
 
     # Normal activity
@@ -177,25 +179,70 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         h += "<p>No normal activity recorded.</p>\n"
     h += "</div>\n"
 
-    # Boundary violations
+    # 4. Boundary Violations — always rendered so the README section-9 layout is
+    # stable regardless of session content.
+    h += '<div class="section"><h2>&#128683; Boundary Violations</h2>\n'
     if safety["boundary_violations"]:
-        h += '<div class="section"><h2>&#128683; Boundary Violations</h2><ul>\n'
+        h += "<ul>\n"
         for f in safety["boundary_violations"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
+        h += "</ul>\n"
+    else:
+        h += '<p class="empty">No boundary violations.</p>\n'
+    h += "</div>\n"
 
-    # Protected path access
+    # 5. Protected Path Access — always rendered.
+    h += '<div class="section"><h2>&#128274; Protected Path Access</h2>\n'
     if safety["protected_accesses"]:
-        h += '<div class="section"><h2>&#128274; Protected Path Access</h2><ul>\n'
+        h += "<ul>\n"
         for f in safety["protected_accesses"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
+        h += "</ul>\n"
+    else:
+        h += '<p class="empty">No protected path access.</p>\n'
+    h += "</div>\n"
 
-    # Suspicious sequences (possible secret exfiltration) — CRITICAL. This is a
-    # Python-only finding, so it will not appear in the C Alert Details table;
-    # surface it explicitly here.
+    # 6. Dangerous Commands — always rendered.
+    h += '<div class="section"><h2>&#9888;&#65039; Dangerous Commands</h2>\n'
+    if safety["dangerous_commands"]:
+        h += "<ul>\n"
+        for f in safety["dangerous_commands"]:
+            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+        h += "</ul>\n"
+    else:
+        h += '<p class="empty">No dangerous commands.</p>\n'
+    h += "</div>\n"
+
+    # 7. Git Status/Diff Summary
+    h += '<div class="section"><h2>&#128204; Git Status/Diff Summary</h2>\n'
+    h += f'<p><b>git status:</b></p><pre>{html.escape(git["status"] or "(clean)")}</pre>\n'
+    h += f'<p><b>git diff --stat:</b></p><pre>{html.escape(git["diff_stat"] or "(no changes)")}</pre>\n'
+    h += "</div>\n"
+
+    # 8. Alert Details — the C rule-engine alert table plus the Python-derived
+    # finding subsections (B-001 unsafe permission / file deletions, B-002
+    # suspicious sequences, B-003 review-needed). Rendered even with no C alert,
+    # since Python findings can independently support the verdict.
+    alerts = [e for e in events if e.get("alert")]
+    has_findings = bool(alerts or safety.get("suspicious_sequences")
+                        or safety.get("unsafe_permission_changes")
+                        or safety.get("file_deletions") or safety.get("review_findings"))
+    h += '<div class="section"><h2>&#128680; Alert Details</h2>\n'
+    if alerts:
+        h += "<table>\n"
+        h += "<tr><th>Severity</th><th>Rule</th><th>PID</th><th>Comm</th><th>Path/Argv</th><th>Reason</th></tr>\n"
+        for a in alerts:
+            sev = a.get("severity", "")
+            sc = SEV_COLORS.get(sev, "#666")
+            h += (f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
+                  f"<td>{html.escape(a.get('rule_id',''))}</td>"
+                  f"<td>{html.escape(str(a.get('pid','')))}</td>"
+                  f"<td>{html.escape(a.get('comm',''))}</td>"
+                  f"<td>{html.escape(format_event_detail(a))}</td>"
+                  f"<td>{html.escape(a.get('reason',''))}</td></tr>\n")
+        h += "</table>\n"
     if safety.get("suspicious_sequences"):
-        h += '<div class="section"><h2>&#128680; Suspicious Sequences</h2><ul>\n'
+        h += '<h3>&#128680; Suspicious Sequences</h3><ul>\n'
         for f in safety["suspicious_sequences"]:
             sc = SEV_COLORS.get(f.get("severity", ""), "#666")
             h += (f'  <li><span class="sev" style="background:{sc}">'
@@ -204,61 +251,45 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
                   f'{html.escape(f.get("detail", ""))} '
                   f'(tool: {html.escape(f.get("tool", ""))}, '
                   f'path: {html.escape(f.get("path", ""))})</li>\n')
-        h += "</ul></div>\n"
-
-    # Dangerous commands
-    if safety["dangerous_commands"]:
-        h += '<div class="section"><h2>&#9888;&#65039; Dangerous Commands</h2><ul>\n'
-        for f in safety["dangerous_commands"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
-
-    # Unsafe permission changes (world-writable fchmodat)
+        h += "</ul>\n"
     if safety.get("unsafe_permission_changes"):
-        h += '<div class="section"><h2>&#128275; Unsafe Permission Changes</h2><ul>\n'
+        h += '<h3>&#128275; Unsafe Permission Changes</h3><ul>\n'
         for f in safety["unsafe_permission_changes"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
-
-    # File deletions (review signal)
+        h += "</ul>\n"
     if safety.get("file_deletions"):
-        h += '<div class="section"><h2>&#128465;&#65039; File Deletions</h2><ul>\n'
+        h += '<h3>&#128465;&#65039; File Deletions</h3><ul>\n'
         for f in safety["file_deletions"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
-
-    # Review-needed evidence (README section 7): high-volume / build-config /
-    # git-reported deletions derived from the git change summary.
+        h += "</ul>\n"
     if safety.get("review_findings"):
-        h += '<div class="section"><h2>&#128269; Review Needed</h2><ul>\n'
+        h += '<h3>&#128269; Review Needed</h3><ul>\n'
         for f in safety["review_findings"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
-        h += "</ul></div>\n"
-
-    # Git summary
-    h += '<div class="section"><h2>&#128204; Git Summary</h2>\n'
-    h += f'<p><b>git status:</b></p><pre>{html.escape(git["status"] or "(clean)")}</pre>\n'
-    h += f'<p><b>git diff --stat:</b></p><pre>{html.escape(git["diff_stat"] or "(no changes)")}</pre>\n'
+        h += "</ul>\n"
+    if not has_findings:
+        h += '<p class="empty">No alerts or findings.</p>\n'
     h += "</div>\n"
 
-    # Alert table
-    alerts = [e for e in events if e.get("alert")]
-    if alerts:
-        h += '<div class="section"><h2>&#128680; Alert Details</h2>\n<table>\n'
-        h += "<tr><th>Severity</th><th>Rule</th><th>PID</th><th>Comm</th><th>Path/Argv</th><th>Reason</th></tr>\n"
-        for a in alerts:
-            sev = a.get("severity", "")
-            sc = SEV_COLORS.get(sev, "#666")
-            detail = format_event_detail(a)
-            h += (f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
-                  f"<td>{html.escape(a.get('rule_id',''))}</td>"
-                  f"<td>{a.get('pid','')}</td>"
-                  f"<td>{html.escape(a.get('comm',''))}</td>"
-                  f"<td>{html.escape(detail)}</td>"
-                  f"<td>{html.escape(a.get('reason',''))}</td></tr>\n")
-        h += "</table></div>\n"
+    # 9. Recent Events — the last 50 filtered events, newest first, each with
+    # event-aware detail so all six event types render meaningfully.
+    h += '<div class="section"><h2>&#128220; Recent Events</h2>\n'
+    recent = events[-50:][::-1]
+    if recent:
+        h += (f'<p>Showing the most recent {len(recent)} of {len(events)} '
+              f'event(s), newest first.</p>\n')
+        h += "<table>\n<tr><th>Event</th><th>PID</th><th>Comm</th><th>Detail</th></tr>\n"
+        for e in recent:
+            h += (f"<tr><td>{html.escape(e.get('event',''))}</td>"
+                  f"<td>{html.escape(str(e.get('pid','')))}</td>"
+                  f"<td>{html.escape(e.get('comm',''))}</td>"
+                  f"<td>{html.escape(format_event_detail(e))}</td></tr>\n")
+        h += "</table>\n"
+    else:
+        h += '<p class="empty">No events recorded.</p>\n'
+    h += "</div>\n"
 
-    # Recommendations
+    # 10. Recommended Actions
     h += '<div class="section"><h2>&#128161; Recommended Actions</h2><ul>\n'
     for r in safety["recommendations"]:
         h += f"  <li>{html.escape(r)}</li>\n"
