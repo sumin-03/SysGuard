@@ -36,8 +36,10 @@ static struct scenario scenarios[] = {
     {SYSGUARD_EVENT_OPEN, "cat",     "",                 "",                  "/etc/shadow", 3015, 3000, 0, "", "", 0, 0},
     {SYSGUARD_EVENT_OPEN, "cat",     "",                 "",                  "/etc/sudoers", 3016, 3000, 1000, "", "", 0, 0},
 
-    /* Dangerous commands */
+    /* Dangerous commands. comm is the caller (e.g. "bash"); the executed
+     * program is exe_path/argv, per the event.h caller-vs-target contract. */
     {SYSGUARD_EVENT_EXEC, "git",     "/usr/bin/git",     "git reset --hard",  "", 3017, 3000, 1000, "", "", 0, 0},
+    {SYSGUARD_EVENT_EXEC, "bash",    "/usr/bin/git",     "git clean -fd",     "", 3023, 3000, 1000, "", "", 0, 0},
     {SYSGUARD_EVENT_EXEC, "rm",      "/usr/bin/rm",      "rm -rf build/",     "", 3018, 3000, 1000, "", "", 0, 0},
     {SYSGUARD_EVENT_EXEC, "chmod",   "/usr/bin/chmod",   "chmod 777 test.sh", "", 3019, 3000, 1000, "", "", 0, 0},
     /* Caller is a shell (comm), the executed program is curl (exe_path): proves

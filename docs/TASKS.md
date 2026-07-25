@@ -28,7 +28,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-A-004 | P1 | **DONE** | Add `project-boundary-access` using normalized paths + the configured project root (needs an explicit rule context instead of the event-only `rules_evaluate` API). |
 | TASK-A-005 | P1 | DEFERRED | C-engine stateful `possible-secret-exfiltration`. *Deferred by director:* the Python detector (TASK-B-002) is the MVP authority for this sequence (it owns the user-visible verdict/report and already has the full ordered session); a second C-side state machine with PID/subtree lifecycle is not warranted until a real-time-alert requirement appears. Revisit only then. |
 | TASK-A-006 | P1 | READY | Complete additive JSONL serialization for every supported payload (rename paths, flags, mode, CONNECT once designed, consistent alert/non-alert records). *Partially delivered by TASK-A-001 for the current event set.* |
-| TASK-A-007 | P1 | READY | Expand `fake_collector` into deterministic coverage of all README event types and all 13 specified rules, including ordered sequence scenarios. |
+| TASK-A-007 | P1 | **DONE** | Expand `fake_collector` into deterministic coverage of all README event types and all 13 specified rules, including ordered sequence scenarios. |
 | TASK-A-008 | P2 | READY | Add non-root C tests for rule predicates, sequence state, event-name mapping, JSON escaping, payload serialization, and fake-mode schema compatibility. |
 | TASK-A-009 | P2 | READY | Generalize path normalization to UNLINK, CHMOD, and both RENAME paths; document/handle non-AT_FDCWD dirfd-relative paths. *Path-field generalization delivered by TASK-A-001; dirfd handling still open.* |
 | TASK-A-010 | P2 | READY | Reconcile Makefile behavior with README "Build": `make` should produce `build/sysguard.bpf.o`, `build/sysguard.skel.h`, and `build/sysguard`, while preserving focused targets. |
@@ -45,11 +45,49 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 
-**Next up (highest-priority READY):** TASK-A-007 (fake coverage — small: git-clean-force scenario) / TASK-B-005 (report Recent Events + section order — unblocked by B-001) / TASK-B-007 (GUI safety preview — now unblocked by B-003).
+**Next up (highest-priority READY):** TASK-B-005 (report Recent Events + section order — unblocked by B-001) / TASK-B-007 (GUI safety preview — unblocked by B-003). All P1 tasks are now DONE or DEFERRED/BLOCKED.
 
 ---
 
 ## Completed
+
+### TASK-A-007 — Fake-collector rule coverage (git-clean-force)
+*Completed 2026-07-25.*
+
+Closed the last achievable fake-coverage gap by adding a single deterministic
+`git-clean-force` EXEC scenario. The fake session now exercises every
+implemented C rule and all six emitted event types.
+
+**File changed (1):** `src/fake_collector.c` — one new `scenarios[]` row
+(`comm="bash"` caller, `exe_path="/usr/bin/git"`, `argv="git clean -fd"`,
+pid 3023 / ppid 3000, HIGH via the git-clean-force rule), plus a clarifying
+comment on the caller-vs-target convention for the dangerous-command group.
+
+**Coverage after A-007:** the fake session emits 22 events across all 6
+implemented event types and fires all 11 implemented canonical C rules
+(destructive-rm, downloader-exec, env-file-access, file-unlink, git-reset-hard,
+**git-clean-force**, project-boundary-access, shadow-access, ssh-key-access,
+sudoers-access, unsafe-chmod). Combined with the Python `possible-secret-
+exfiltration` sequence (the `.env`-OPEN-before-`curl`-EXEC ordering is
+preserved), that is 12 of the README's 13 canonical rules. Only
+`outbound-connect` remains unavailable — it needs the connect syscall +
+destination-address ABI (TASK-A-002, BLOCKED).
+
+**Do-not-touch honored:** no change to `rules.c/rules.h`, `bpf/`, `event.h`,
+`jsonl_writer.c`, `target_filter.c`, any `app/*.py`, the existing
+A-001/A-003/A-004 scenario rows, or the `{PROJECT}` sentinel.
+
+**Verification (all non-sudo):** build warning-free; fake session = 22 events,
+6 event types; `git-clean-force` fires HIGH with `comm="bash"`,
+`path="/usr/bin/git"`, `argv="git clean -fd"`; all 11 rule_ids present,
+`outbound-connect` absent; Python sequence still fires → UNSAFE; all JSONL
+parses; full 54-test Python suite still green.
+
+**Director review:** Codex reviewed the `src/fake_collector.c` diff — the change
+passes all checks (APPROVED). The only note was that `docs/TASKS.md` is also
+modified; that is the intended task-board update, committed together here.
+
+
 
 ### TASK-B-003 — README section-7 REVIEW_NEEDED heuristics
 *Completed 2026-07-25.*
