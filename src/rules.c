@@ -34,7 +34,64 @@ static void fill_alert(struct sysguard_alert *out, const struct sysguard_event *
     snprintf(out->recommendation, sizeof(out->recommendation), "%s", rec);
 }
 
-int rules_evaluate(const struct sysguard_event *ev, struct sysguard_alert *out) {
+/* Read-only system locations every process touches at startup (loader, libs,
+ * locale, /proc self-inspection, common tool config). Mirrors app/policy.py's
+ * SYSTEM_PATH_PREFIXES so terminal/JSONL are not flooded with boundary HIGH
+ * alerts for routine system access. Genuinely sensitive system files
+ * (/etc/shadow, /etc/sudoers, ~/.ssh, ...) are still caught by the protected
+ * rules above, which run first by first-match ordering. */
+static const char *system_path_prefixes[] = {
+    "/usr/", "/lib/", "/lib64/", "/opt/",
+    "/proc/", "/sys/", "/dev/", "/run/",
+    "/etc/ld.so", "/etc/locale", "/etc/nsswitch.conf",
+    "/etc/passwd", "/etc/group", "/etc/localtime",
+    "/etc/gitconfig", "/etc/gitattributes",
+    "/etc/terminfo", "/etc/inputrc", "/etc/bash",
+};
+
+/* Benign per-user tool config, matched as a substring (mirrors policy.py). */
+static const char *user_config_suffixes[] = {
+    "/.gitconfig", "/.config/git/",
+};
+
+static int path_is_system_allowlisted(const char *path) {
+    if (!path || !path[0]) return 0;
+    for (size_t i = 0; i < sizeof(system_path_prefixes) / sizeof(system_path_prefixes[0]); i++) {
+        if (strncmp(path, system_path_prefixes[i], strlen(system_path_prefixes[i])) == 0)
+            return 1;
+    }
+    for (size_t i = 0; i < sizeof(user_config_suffixes) / sizeof(user_config_suffixes[0]); i++) {
+        if (strstr(path, user_config_suffixes[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/* The boundary rule is only meaningful with an absolute project root. A NULL
+ * ctx, NULL/empty project_path, or a relative root ("." etc.) disables it. */
+static int boundary_ctx_valid(const struct sysguard_rule_ctx *ctx) {
+    return ctx && ctx->project_path && ctx->project_path[0] == '/';
+}
+
+/* Component-aware containment. A single trailing '/' on the root is ignored so
+ * "/p" and "/p/" behave identically. The path is inside iff it equals the root
+ * exactly or begins with root + "/". This keeps "/work/project2" out of
+ * "/work/project". A root of "/" contains every absolute path. Lexical only —
+ * symlink/realpath resolution is the Python layer's job. */
+static int path_is_inside_project(const char *path, const char *project_path) {
+    size_t rlen = strlen(project_path);
+    if (rlen > 1 && project_path[rlen - 1] == '/')
+        rlen--;                       /* ignore one trailing slash */
+    if (rlen <= 1)
+        return path[0] == '/';        /* root is "/" -> all absolute paths inside */
+    if (strncmp(path, project_path, rlen) != 0)
+        return 0;
+    return path[rlen] == '\0' || path[rlen] == '/';
+}
+
+int rules_evaluate(const struct sysguard_event *ev,
+                   const struct sysguard_rule_ctx *ctx,
+                   struct sysguard_alert *out) {
     memset(out, 0, sizeof(*out));
 
     if (ev->type == SYSGUARD_EVENT_EXEC) {
@@ -67,44 +124,16 @@ int rules_evaluate(const struct sysguard_event *ev, struct sysguard_alert *out) 
                        reason, "Restrict permissions to minimum required.");
             return 1;
         }
-        if (strstr(ev->argv, "chown root")) {
-            char reason[256];
-            snprintf(reason, sizeof(reason), "Ownership change to root: %s", ev->argv);
-            fill_alert(out, ev, "unsafe-chown", SYSGUARD_SEV_HIGH,
-                       reason, "Verify ownership change is intentional.");
-            return 1;
-        }
-
-        /* shell-exec */
-        {
-            const char *shells[] = {"bash", "sh", "zsh"};
-            if (match_any(ev->comm, shells, 3)) {
-                char reason[256];
-                snprintf(reason, sizeof(reason), "Shell process executed: %s", ev->comm);
-                fill_alert(out, ev, "shell-exec", SYSGUARD_SEV_MEDIUM,
-                           reason, "Review shell command context.");
-                return 1;
-            }
-        }
-
-        /* suspicious-netcat */
-        {
-            const char *nc[] = {"nc", "netcat", "ncat"};
-            if (match_any(ev->comm, nc, 3) || match_any(ev->exe_path, nc, 3)) {
-                char reason[256];
-                snprintf(reason, sizeof(reason), "Netcat-like tool executed: %s", ev->comm);
-                fill_alert(out, ev, "suspicious-netcat", SYSGUARD_SEV_HIGH,
-                           reason, "Investigate network activity. Check for reverse shell.");
-                return 1;
-            }
-        }
-
-        /* downloader-exec */
+        /* downloader-exec: curl/wget executed. Match on exe_path/argv (the
+         * program that actually ran), never comm — at execve entry comm is the
+         * CALLER (e.g. the shell), not the downloader itself. See event.h
+         * FIELD SEMANTICS. */
         {
             const char *dl[] = {"curl", "wget"};
-            if (match_any(ev->comm, dl, 2) || match_any(ev->exe_path, dl, 2)) {
+            if (match_any(ev->exe_path, dl, 2) || match_any(ev->argv, dl, 2)) {
                 char reason[256];
-                snprintf(reason, sizeof(reason), "Downloader executed: %s", ev->comm);
+                snprintf(reason, sizeof(reason), "Downloader executed: %s",
+                         ev->exe_path[0] ? ev->exe_path : ev->argv);
                 fill_alert(out, ev, "downloader-exec", SYSGUARD_SEV_MEDIUM,
                            reason, "Check download target and destination.");
                 return 1;
@@ -131,15 +160,6 @@ int rules_evaluate(const struct sysguard_event *ev, struct sysguard_alert *out) 
             return 1;
         }
 
-        /* docker-sock-access */
-        if (strstr(ev->path, "/var/run/docker.sock")) {
-            char reason[256];
-            snprintf(reason, sizeof(reason), "Docker socket accessed by %s (pid %u)", ev->comm, ev->pid);
-            fill_alert(out, ev, "docker-sock-access", SYSGUARD_SEV_HIGH,
-                       reason, "Docker socket access can lead to container escape.");
-            return 1;
-        }
-
         /* ssh-key-access */
         if (strstr(ev->path, ".ssh/id_rsa") || strstr(ev->path, ".ssh/id_ed25519") ||
             strstr(ev->path, ".ssh/config")) {
@@ -159,12 +179,47 @@ int rules_evaluate(const struct sysguard_event *ev, struct sysguard_alert *out) 
             return 1;
         }
 
-        /* aws-credentials */
-        if (strstr(ev->path, ".aws/credentials")) {
+        /* project-boundary-access: openat of an absolute path outside the
+         * configured project root. Evaluated LAST in the OPEN branch so the
+         * specific protected-path rules above win by first-match, and skipped
+         * for routine system/tool-config paths so it does not flood alerts. */
+        if (boundary_ctx_valid(ctx) &&
+            ev->path[0] == '/' &&
+            !path_is_system_allowlisted(ev->path) &&
+            !path_is_inside_project(ev->path, ctx->project_path)) {
             char reason[256];
-            snprintf(reason, sizeof(reason), "AWS credentials accessed: %s by %s", ev->path, ev->comm);
-            fill_alert(out, ev, "aws-cred-access", SYSGUARD_SEV_CRITICAL,
-                       reason, "Rotate AWS access keys immediately if exposure is suspected.");
+            snprintf(reason, sizeof(reason),
+                     "File accessed outside project boundary: %s (project root %s)",
+                     ev->path, ctx->project_path);
+            fill_alert(out, ev, "project-boundary-access", SYSGUARD_SEV_HIGH,
+                       reason, "Investigate access outside the project directory.");
+            return 1;
+        }
+    }
+
+    if (ev->type == SYSGUARD_EVENT_UNLINK) {
+        /* file-unlink: a deletion was requested (captured at syscall entry, so
+         * this records the attempt, not a confirmed removal). */
+        char reason[256];
+        snprintf(reason, sizeof(reason),
+                 "File deletion requested: %s by %s (pid %u)",
+                 ev->path, ev->comm, ev->pid);
+        fill_alert(out, ev, "file-unlink", SYSGUARD_SEV_MEDIUM,
+                   reason, "Verify the file was meant to be removed. Check git status.");
+        return 1;
+    }
+
+    if (ev->type == SYSGUARD_EVENT_CHMOD) {
+        /* unsafe-chmod: world-writable bit (0002) requested via fchmodat. mode
+         * is a permission bitmask, so match bits and render the reason in octal
+         * (e.g. 0777), never the decimal value. */
+        if ((ev->mode & 0002) != 0) {
+            char reason[256];
+            snprintf(reason, sizeof(reason),
+                     "World-writable permission set: chmod %o on %s by %s",
+                     (unsigned int)(ev->mode & 07777), ev->path, ev->comm);
+            fill_alert(out, ev, "unsafe-chmod", SYSGUARD_SEV_HIGH,
+                       reason, "Restrict permissions to the minimum required.");
             return 1;
         }
     }

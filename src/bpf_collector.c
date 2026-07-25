@@ -102,12 +102,14 @@ static void log_event(const struct sysguard_event *e, void *ctx)
     struct sysguard_event ev = *e;  // mutable copy: filter may rewrite ev.path
 
     // Drop events outside the monitored process family. The filter also turns a
-    // relative openat path into an absolute one using the live /proc/<pid>/cwd.
+    // relative file path (openat / unlinkat / fchmodat / renameat2) into an
+    // absolute one using the live /proc/<pid>/cwd.
     if (!target_filter_process(lc->filter, &ev))
         return;
 
     struct sysguard_alert alert;
-    if (rules_evaluate(&ev, &alert)) {
+    struct sysguard_rule_ctx rctx = { lc->session->project_path };
+    if (rules_evaluate(&ev, &rctx, &alert)) {
         printf("  [%s] %s — %s\n",
                sysguard_severity_string(alert.severity),
                alert.rule_id, alert.reason);
