@@ -67,8 +67,10 @@ def generate_report(jsonl_path: str, target_comm: str = "", project_path: str = 
 
     events = filter_target_events(all_events, target_comm)
     summary = summarize_session(events)
-    safety = evaluate_commit_safety(events, project_path)
+    # Fetch the git summary before evaluating so its change set can feed the
+    # REVIEW_NEEDED heuristics (README section 7).
     git = get_git_summary(project_path)
+    safety = evaluate_commit_safety(events, project_path, git)
 
     safety_color = SAFETY_COLORS.get(safety["safety"], "#666")
     session_id = all_events[0].get("session_id", os.path.basename(jsonl_path)) if all_events else ""
@@ -222,6 +224,14 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     if safety.get("file_deletions"):
         h += '<div class="section"><h2>&#128465;&#65039; File Deletions</h2><ul>\n'
         for f in safety["file_deletions"]:
+            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+        h += "</ul></div>\n"
+
+    # Review-needed evidence (README section 7): high-volume / build-config /
+    # git-reported deletions derived from the git change summary.
+    if safety.get("review_findings"):
+        h += '<div class="section"><h2>&#128269; Review Needed</h2><ul>\n'
+        for f in safety["review_findings"]:
             h += f'  <li>{html.escape(f["detail"])}</li>\n'
         h += "</ul></div>\n"
 

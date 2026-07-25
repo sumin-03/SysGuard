@@ -37,7 +37,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-A-013 | P3 | READY | Add build-time ABI assertions and a documented event-contract versioning policy for future shared-struct changes. |
 | TASK-B-001 | P1 | **DONE** | Align the Python analysis + report layer with `unlinkat`/`renameat2`/`fchmodat`/`exit_group` and the additive `old_path`/`new_path`/`flags`/`mode` contract (repairs the live A→B contract break). |
 | TASK-B-002 | P1 | **DONE** | Add session-scoped `possible-secret-exfiltration` detection (`.env` access followed by `curl`/`wget`) in the Python policy. |
-| TASK-B-003 | P1 | DEPENDS-ON:TASK-B-001 | Implement README-conformant `REVIEW_NEEDED` decisions (high-volume changes, build/config edits, sandbox-only deletions). |
+| TASK-B-003 | P1 | **DONE** | Implement README-conformant `REVIEW_NEEDED` decisions (high-volume changes, build/config edits, sandbox-only deletions). |
 | TASK-B-004 | P2 | **DONE** | Reconcile Python `DANGEROUS_COMMANDS` with the canonical README/C rules — drop `chown root`/`nc`/`netcat`/`ncat`; treat standalone `curl`/`wget` as downloader evidence, not an UNSAFE command. |
 | TASK-B-005 | P2 | DEPENDS-ON:TASK-B-001 | Complete report conformance: add "Recent Events", correct the 10-section order, render every event payload meaningfully. |
 | TASK-B-006 | P1 | **DONE** | Add a non-sudo Python test suite (policy, sequence ordering, event-contract compatibility, safety verdicts, HTML escaping, report sections). Independent of TASK-A-008. |
@@ -45,11 +45,65 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 
-**Next up (highest-priority READY):** TASK-A-007 (fake coverage) / TASK-B-003 (REVIEW_NEEDED heuristics — now unblocked by B-001).
+**Next up (highest-priority READY):** TASK-A-007 (fake coverage — small: git-clean-force scenario) / TASK-B-005 (report Recent Events + section order — unblocked by B-001) / TASK-B-007 (GUI safety preview — now unblocked by B-003).
 
 ---
 
 ## Completed
+
+### TASK-B-003 — README section-7 REVIEW_NEEDED heuristics
+*Completed 2026-07-25.*
+
+Activated the previously-vestigial middle verdict tier. `evaluate_commit_safety`
+now consults the git change summary (already collected per README §8) to surface
+REVIEW_NEEDED situations that are not clear violations.
+
+**Signals (only when no UNSAFE condition exists):**
+- **High-volume changes** — ≥ 20 distinct paths in `git status --short`
+  (`HIGH_VOLUME_CHANGE_THRESHOLD`, a documented project choice; README gives no number).
+- **Build/config edits** — an explicit allowlist (`Makefile`, `pyproject.toml`,
+  `package.json`, `Cargo.toml`, `go.mod`, `Dockerfile`, … + `requirements*.txt`,
+  `*.lock`, `build.gradle*`, `docker-compose*.yml/.yaml`), matched by basename +
+  fnmatch (no broad `*.json`/`config/` globs).
+- **Deletions** — a git `D` status entry, or an in-project `unlinkat` event.
+
+**Verdict precedence (never downgrades):** UNSAFE (protected/boundary/dangerous/
+world-writable chmod/critical alert/`.env`→curl sequence) → REVIEW_NEEDED
+(deletions or the git signals) → SAFE. Review signals can never mask an UNSAFE
+verdict, and a SAFE session with no git signal stays SAFE.
+
+**Files changed (5):**
+- `app/policy.py` — `HIGH_VOLUME_CHANGE_THRESHOLD` + `BUILD_CONFIG_BASENAMES`/
+  `BUILD_CONFIG_PATTERNS`; `is_build_config_path`, `parse_git_status` (defensive
+  porcelain parse: tolerates the `.strip()` leading-space loss, spaces in
+  filenames, rename `old -> new` → destination, and non-string/empty/`(...)`
+  placeholders as *unavailable evidence* — never raises), `detect_review_signals`;
+  `evaluate_commit_safety(events, project_path="", git_summary=None)` —
+  backward-compatible, adds the `review_findings` key + recommendations, only
+  emits the "safe to commit" line on a SAFE verdict.
+- `app/report.py` — fetch `get_git_summary` before evaluating and pass it in; new
+  escaped "Review Needed" section.
+- `tests/helpers.py` — `fake_git_summary(status=, diff_stat=)` (default unchanged).
+- `tests/test_policy.py` + `tests/test_report.py` — +12 tests (threshold 19/20,
+  build-config incl. nested / `requirements-dev.txt` / `*.lock`, rename→dest,
+  git-deletion, in-project unlink, unavailable/malformed/**non-string** git inert,
+  unsafe-never-downgraded across every UNSAFE category, no safe-message on
+  REVIEW_NEEDED, backward-compatible 2-arg call).
+
+**Do-not-touch honored:** no C/BPF/JSONL change; `app/main.py`,
+`app/session_analyzer.py`, `app/git_summary.py` unchanged; no content/secret
+inspection; git failure-text contract fix deferred to TASK-B-008.
+
+**Verification (all non-sudo):** `py_compile` OK; full suite **54 tests** (was 42,
++12) green; smoke: 20 paths→REVIEW_NEEDED, `pyproject.toml`→REVIEW_NEEDED, single
+src edit→SAFE, `git reset --hard` + 20-path git→UNSAFE, 2-arg call→SAFE; fake-mode
+report still generates; prior verdicts unchanged without a git signal.
+
+**Director review:** Codex reviewed the 5-file diff — one SHOULD-FIX (non-string
+`status` value raised in `parse_git_status`; fixed with an `isinstance` guard +
+regression cases), re-verified — APPROVED.
+
+
 
 ### TASK-B-006 — Non-sudo Python test suite
 *Completed 2026-07-25.*

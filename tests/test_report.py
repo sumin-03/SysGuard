@@ -101,3 +101,28 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertIn(html.escape(hostile_env_path), rendered)
         self.assertNotIn(hostile_env_path, rendered)
         self.assertIn("Suspicious Sequences", rendered)
+
+
+class ReviewNeededReportTests(unittest.TestCase):
+    """The git summary feeds the REVIEW_NEEDED heuristics and renders (B-003)."""
+
+    @mock.patch("report.get_git_summary")
+    def test_build_config_change_renders_review_needed(self, git_summary):
+        git_summary.return_value = fake_git_summary(status=" M pyproject.toml", diff_stat="")
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_jsonl(directory, [make_event("openat", path="/project/a")])
+            rendered = read_text(report.generate_report(path, project_path="/project"))
+        self.assertIn("Commit Safety: REVIEW_NEEDED", rendered)
+        self.assertIn("Review Needed", rendered)
+        self.assertIn("pyproject.toml", rendered)
+
+    @mock.patch("report.get_git_summary")
+    def test_hostile_git_path_is_escaped(self, git_summary):
+        hostile = "<script>x</script>"
+        git_summary.return_value = fake_git_summary(status=f" D {hostile}/gone.py", diff_stat="")
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_jsonl(directory, [make_event("openat", path="/project/a")])
+            rendered = read_text(report.generate_report(path, project_path="/project"))
+        self.assertIn("Review Needed", rendered)
+        self.assertIn(html.escape(hostile), rendered)
+        self.assertNotIn(hostile, rendered)

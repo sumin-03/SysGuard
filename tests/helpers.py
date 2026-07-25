@@ -27,8 +27,8 @@ def write_jsonl(directory, events, filename="session.jsonl"):
     return path
 
 
-def fake_git_summary():
-    return {"status": " M tracked.py", "diff_stat": " tracked.py | 1 +"}
+def fake_git_summary(status=" M tracked.py", diff_stat=" tracked.py | 1 +"):
+    return {"status": status, "diff_stat": diff_stat}
 
 
 def read_text(path):

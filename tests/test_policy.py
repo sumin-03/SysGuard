@@ -166,3 +166,82 @@ class SafetyVerdictTests(unittest.TestCase):
             alert=True, severity="medium", rule_id="downloader-exec",
         )
         self.assertEqual(policy.evaluate_commit_safety([event])["safety"], "SAFE")
+
+
+class ReviewNeededTests(unittest.TestCase):
+    """README section 7 REVIEW_NEEDED heuristics (TASK-B-003)."""
+
+    def _status(self, *paths, code=" M"):
+        return {"status": "\n".join(f"{code} {p}" for p in paths), "diff_stat": ""}
+
+    def test_two_arg_call_is_backward_compatible(self):
+        result = policy.evaluate_commit_safety([make_event("openat", path="/project/a")], "/project")
+        self.assertEqual(result["safety"], "SAFE")
+        self.assertEqual(result["review_findings"], [])
+
+    def test_high_volume_threshold_boundary(self):
+        nineteen = self._status(*[f"/project/src/f{i}.py" for i in range(19)])
+        twenty = self._status(*[f"/project/src/f{i}.py" for i in range(20)])
+        self.assertEqual(policy.evaluate_commit_safety([], "/project", nineteen)["safety"], "SAFE")
+        self.assertEqual(policy.evaluate_commit_safety([], "/project", twenty)["safety"], "REVIEW_NEEDED")
+
+    def test_build_config_files_trigger_review(self):
+        for path in ["pyproject.toml", "src/build/CMakeLists.txt",
+                     "requirements-dev.txt", "poetry.lock", "sub/Cargo.lock"]:
+            with self.subTest(path=path):
+                result = policy.evaluate_commit_safety([], "/project", self._status(path))
+                self.assertEqual(result["safety"], "REVIEW_NEEDED")
+                self.assertTrue(any(f["type"] == "build_config_change" for f in result["review_findings"]))
+
+    def test_ordinary_single_edit_is_safe(self):
+        result = policy.evaluate_commit_safety([], "/project", self._status("src/widget.py"))
+        self.assertEqual(result["safety"], "SAFE")
+        self.assertEqual(result["review_findings"], [])
+
+    def test_git_reported_deletion_triggers_review(self):
+        result = policy.evaluate_commit_safety([], "/project", self._status("src/gone.py", code=" D"))
+        self.assertEqual(result["safety"], "REVIEW_NEEDED")
+        self.assertTrue(any(f["type"] == "sandbox_deletion" for f in result["review_findings"]))
+
+    def test_in_project_unlinkat_still_review(self):
+        result = policy.evaluate_commit_safety([make_event("unlinkat", path="/project/x")], "/project")
+        self.assertEqual(result["safety"], "REVIEW_NEEDED")
+
+    def test_rename_entry_uses_destination_path(self):
+        status = {"status": "R  old_name.py -> pyproject.toml", "diff_stat": ""}
+        result = policy.evaluate_commit_safety([], "/project", status)
+        self.assertEqual(result["safety"], "REVIEW_NEEDED")
+        self.assertTrue(any("pyproject.toml" in f["detail"] for f in result["review_findings"]))
+
+    def test_unavailable_or_malformed_git_summary_is_inert(self):
+        for summary in [None, {}, {"status": ""}, {"status": None}, "not-a-dict",
+                        {"status": 123}, {"status": []}, {"status": {"x": 1}},
+                        {"status": "(git not available)"},
+                        {"status": "(git status unavailable)"}]:
+            with self.subTest(summary=summary):
+                result = policy.evaluate_commit_safety(
+                    [make_event("openat", path="/project/a")], "/project", summary)
+                self.assertEqual(result["safety"], "SAFE")
+                self.assertEqual(result["review_findings"], [])
+
+    def test_review_signals_never_downgrade_unsafe(self):
+        review_git = self._status(*[f"/project/src/f{i}.py" for i in range(25)])
+        unsafe_cases = {
+            "dangerous": [make_event("execve", argv="git reset --hard")],
+            "protected": [make_event("openat", path="/project/.env")],
+            "boundary": [make_event("openat", path="/outside/secret")],
+            "chmod": [make_event("fchmodat", path="/project/x", mode=0o777)],
+            "sequence": [make_event("openat", path="/project/.env"),
+                         make_event("execve", path="/usr/bin/curl", argv="curl x")],
+        }
+        for name, events in unsafe_cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(
+                    policy.evaluate_commit_safety(events, "/project", review_git)["safety"],
+                    "UNSAFE")
+
+    def test_review_verdict_has_no_safe_message(self):
+        result = policy.evaluate_commit_safety([], "/project", self._status("Makefile"))
+        self.assertEqual(result["safety"], "REVIEW_NEEDED")
+        self.assertTrue(result["recommendations"])
+        self.assertNotIn("No issues detected. Safe to commit.", result["recommendations"])
