@@ -41,7 +41,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-004 | P2 | **DONE** | Reconcile Python `DANGEROUS_COMMANDS` with the canonical README/C rules — drop `chown root`/`nc`/`netcat`/`ncat`; treat standalone `curl`/`wget` as downloader evidence, not an UNSAFE command. |
 | TASK-B-005 | P2 | **DONE** | Complete report conformance: add "Recent Events", correct the 10-section order, render every event payload meaningfully. |
 | TASK-B-006 | P1 | **DONE** | Add a non-sudo Python test suite (policy, sequence ordering, event-contract compatibility, safety verdicts, HTML escaping, report sections). Independent of TASK-A-008. |
-| TASK-B-007 | P2 | DEPENDS-ON:TASK-B-003 | Add the README-promised per-session safety-result preview to the GUI session list/panel. |
+| TASK-B-007 | P2 | **DONE** | Add the README-promised per-session safety-result preview to the GUI session list/panel. |
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 
@@ -50,6 +50,45 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-B-007 — GUI per-session safety preview
+*Completed 2026-07-26.*
+
+Filled the README section-10 GUI gap ("session별 safety 결과 미리보기"): each
+session-list row now shows its Commit Safety verdict inline with the README
+badge colors.
+
+**Testability boundary (director design):** the verdict logic lives in a pure,
+Tkinter-free, git-free helper so it is fully unit-tested headless; only the
+widget wiring is a manual step (this box has no `python3-tk`/display).
+
+**Files:**
+- NEW `app/safety_preview.py` — `compute_session_safety(jsonl_path, target_comm,
+  project_path)`: reuses `load_events` → `filter_target_events` →
+  `evaluate_commit_safety(git_summary=None)`; returns SAFE/REVIEW_NEEDED/UNSAFE
+  or `"UNKNOWN"` on any missing/empty/malformed input or error; **never raises,
+  never calls git, imports only policy + session_analyzer**.
+- `app/main.py` — `refresh_logs` renders `<file>  (N bytes)  [VERDICT]` per row
+  with `itemconfig` badge colors (SAFE green / REVIEW_NEEDED orange / UNSAFE red
+  / UNKNOWN gray), isolated per file so one bad session can't abort the refresh;
+  `open_report` uses `split("  ", 1)[0]` so filename recovery is unaffected by
+  the suffix. Start/Stop/Refresh/Open Report/`fix_ownership`/`open_in_browser`/
+  sudo-env restoration unchanged.
+- NEW `tests/test_safety_preview.py` — 10 tests.
+
+**Documented behavior:** the preview passes `git_summary=None`, so it can show
+SAFE where the full report shows REVIEW_NEEDED (git-only heuristics are absent);
+Open Report remains the authoritative, git-aware verdict.
+
+**Verification (non-sudo):** `py_compile` OK for `safety_preview.py` +
+`main.py`; the 10 helper tests pass (SAFE/REVIEW_NEEDED/UNSAFE, missing/empty/
+malformed → UNKNOWN, project_path + target_comm derivation, git never invoked);
+full suite **77 tests** (was 67); an AST check confirms the helper imports only
+policy + session_analyzer. **The Tkinter rendering + colors are a manual step on
+the target VM (python3-tk + display).**
+
+**Director review:** Codex reviewed the diff — APPROVED (no blocker/should-fix);
+one nit (add a target_comm-derivation test) applied.
 
 ### TASK-A-002 — connect tracepoint + outbound-connect rule (rules 13/13)
 *Completed 2026-07-26.*

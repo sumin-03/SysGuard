@@ -11,8 +11,19 @@ import signal
 import getpass
 import pwd
 
+from safety_preview import compute_session_safety
+
 SYSGUARD_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "sysguard")
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+
+# README safety badge colors (SAFE=green, REVIEW_NEEDED=orange, UNSAFE=red);
+# neutral gray when the preview cannot be computed.
+SAFETY_COLORS = {
+    "SAFE": "#28a745",
+    "REVIEW_NEEDED": "#fd7e14",
+    "UNSAFE": "#dc3545",
+    "UNKNOWN": "#666666",
+}
 REAL_USER = os.environ.get("SUDO_USER", getpass.getuser())
 REAL_UID = int(os.environ.get("SUDO_UID", os.getuid()))
 REAL_GID = int(os.environ.get("SUDO_GID", os.getgid()))
@@ -210,9 +221,18 @@ class SysGuardApp:
     def refresh_logs(self):
         self.listbox.delete(0, tk.END)
         files = sorted(glob.glob(os.path.join(LOG_DIR, "session_*.jsonl")), reverse=True)
-        for f in files:
-            sz = os.path.getsize(f)
-            self.listbox.insert(tk.END, f"{os.path.basename(f)}  ({sz} bytes)")
+        target = self.target_var.get().strip()
+        project = self.project_var.get().strip()
+        for i, f in enumerate(files):
+            # Per-file isolation: one missing/unreadable/malformed session must
+            # not abort the whole refresh — it just shows [UNKNOWN].
+            try:
+                sz = os.path.getsize(f)
+            except OSError:
+                sz = 0
+            verdict = compute_session_safety(f, target_comm=target, project_path=project)
+            self.listbox.insert(tk.END, f"{os.path.basename(f)}  ({sz} bytes)  [{verdict}]")
+            self.listbox.itemconfig(i, foreground=SAFETY_COLORS.get(verdict, "#666666"))
         self.status.config(text=f"{len(files)} session(s) found")
 
     def open_report(self):
@@ -221,7 +241,10 @@ class SysGuardApp:
             messagebox.showwarning("No selection", "Select a log session first.")
             return
         entry = self.listbox.get(sel[0])
-        fname = entry.split("  ")[0]
+        # The row is "<filename>  (<N> bytes)  [<VERDICT>]"; the filename is the
+        # first double-space-delimited field. Bound the split so later suffix
+        # changes cannot alter filename recovery.
+        fname = entry.split("  ", 1)[0]
         jsonl_path = os.path.join(LOG_DIR, fname)
 
         try:
