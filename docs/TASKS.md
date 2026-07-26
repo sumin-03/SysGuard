@@ -23,11 +23,11 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | ID | Priority | Status | Goal |
 |----|----------|--------|------|
 | TASK-A-001 | P1 | **DONE** | Add ABI-ready `unlinkat`, `renameat2`, `fchmodat`, `exit_group` collection and carry those events through JSONL, rules, fake mode, and PoC output. |
-| TASK-A-002 | P1 | BLOCKED | Define the CONNECT wire representation, then implement `sys_enter_connect` + `outbound-connect`. *Blocked*: README requires a destination address but `event.h` reserves no address-family/address/port fields. |
+| TASK-A-002 | P1 | **DONE** | Define the CONNECT wire representation, then implement `sys_enter_connect` + `outbound-connect`. (ABI: appended `addr_family`/`dest_addr[16]`/`dest_port`.) |
 | TASK-A-003 | P1 | **DONE** | Align `src/rules.c` with the README's 13-rule set — remove/disable the five undocumented rules (`unsafe-chown`, `shell-exec`, `suspicious-netcat`, `docker-sock-access`, `aws-cred-access`) and correct executable matching to use `exe_path`/`argv` semantics. |
 | TASK-A-004 | P1 | **DONE** | Add `project-boundary-access` using normalized paths + the configured project root (needs an explicit rule context instead of the event-only `rules_evaluate` API). |
 | TASK-A-005 | P1 | DEFERRED | C-engine stateful `possible-secret-exfiltration`. *Deferred by director:* the Python detector (TASK-B-002) is the MVP authority for this sequence (it owns the user-visible verdict/report and already has the full ordered session); a second C-side state machine with PID/subtree lifecycle is not warranted until a real-time-alert requirement appears. Revisit only then. |
-| TASK-A-006 | P1 | READY | Complete additive JSONL serialization for every supported payload (rename paths, flags, mode, CONNECT once designed, consistent alert/non-alert records). *Partially delivered by TASK-A-001 for the current event set.* |
+| TASK-A-006 | P1 | **DONE** | Complete additive JSONL serialization for every supported payload (rename paths, flags, mode, CONNECT, consistent alert/non-alert records). *Delivered by TASK-A-001 (mutation fields) + TASK-A-002 (connect fields).* |
 | TASK-A-007 | P1 | **DONE** | Expand `fake_collector` into deterministic coverage of all README event types and all 13 specified rules, including ordered sequence scenarios. |
 | TASK-A-008 | P2 | READY | Add non-root C tests for rule predicates, sequence state, event-name mapping, JSON escaping, payload serialization, and fake-mode schema compatibility. |
 | TASK-A-009 | P2 | READY | Generalize path normalization to UNLINK, CHMOD, and both RENAME paths; document/handle non-AT_FDCWD dirfd-relative paths. *Path-field generalization delivered by TASK-A-001; dirfd handling still open.* |
@@ -45,11 +45,71 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 
-**Next up:** TASK-A-002 (design the CONNECT address ABI to unblock `outbound-connect` → 13/13 canonical rules) is the natural finish line but requires the first-ever shared-ABI change; remaining READY infra tasks are TASK-B-007 (GUI preview), TASK-A-008 (C tests), TASK-A-010 (Makefile), TASK-A-011 (EXIT-based PID retirement), TASK-B-008/B-009.
+**All 13 README canonical rules are now implemented (13/13).** Remaining work is P2/P3 polish/infra only: TASK-A-008 (C tests), TASK-A-009 (dirfd paths), TASK-A-010 (Makefile), TASK-A-011 (EXIT-based PID retirement), TASK-A-012 (comments), TASK-A-013 (ABI version policy — partly seeded by A-002's `_Static_assert`s), TASK-B-007 (GUI safety preview), TASK-B-008 (git safe-empty), TASK-B-009 (malformed-JSONL counts). Merging the branch to `main` + pushing is also available.
 
 ---
 
 ## Completed
+
+### TASK-A-002 — connect tracepoint + outbound-connect rule (rules 13/13)
+*Completed 2026-07-26.*
+
+Implemented the 7th README tracepoint and completed canonical rule coverage. The
+**first change to the shared wire ABI**: appended
+`addr_family` / `dest_addr[16]` / `dest_port` to `struct sysguard_event`
+(tail-only), guarded by compile-time `_Static_assert`s on the offsets (1320/
+1328/1332/1348), field widths (4/16/2), and total size (1352) so an accidental
+reorder/resize is caught in BOTH the BPF and user-space builds. This satisfies
+**TASK-A-006** (additive JSONL for every payload) as well.
+
+**Design decisions (director-approved):** binary family-agnostic address
+storage (not text); the C JSONL layer renders it via `inet_ntop` so Python stays
+simple; `outbound-connect` is MEDIUM and excludes loopback/link-local/
+unspecified but NOT RFC1918/ULA (a private-LAN host is still outbound); no Python
+policy rule (a standalone MEDIUM connect stays SAFE, like a downloader).
+
+**Files changed (11 + board):**
+- `src/event.h` — `SYSGUARD_CONNECT_ADDR_LEN` + 3 appended fields + 6 ABI asserts.
+- `bpf/sysguard.bpf.c` — `handle_connect`: read `sa_family` first, then
+  constant-size, `addrlen`-gated reads of a fixed stack `sockaddr_in`/`_in6`,
+  `bpf_ntohs` for the port; `clear_payload` zeroes the binary fields;
+  collection-only (attempt, not success).
+- `src/jsonl_writer.c` — `"connect"` name; `render_dest_addr` (`inet_ntop`);
+  additive `addr_family`/`dest_addr`/`dest_port` in both writers, escaped,
+  back-compatible.
+- `src/rules.c` — `connect_is_local` (binary loopback/link-local/unspecified
+  checks) + `format_connect_endpoint`; MEDIUM `outbound-connect` first-match
+  branch; other 12 rules undisturbed.
+- `src/fake_collector.c` — separate `connect_scenarios[]` table + shared
+  `fake_emit` helper (existing 22 rows untouched): external IPv4/IPv6 fire, IPv4
+  `127.0.0.1` + IPv6 `::1` stay silent.
+- `src/poc_main.c` — CONNECT print (`ip:port` / `[ipv6]:port`).
+- `src/target_filter.c` — comment.
+- `app/report.py` — `format_event_detail` CONNECT rendering.
+- `tests/` — +6 (standalone MEDIUM connect → SAFE; connect counted;
+  IPv4/IPv6 render; missing-addr; alert endpoint in HTML; legacy JSONL without
+  the new keys still renders).
+
+**Verification (all non-sudo):** clean warning-free build (all 6 `_Static_assert`s
+hold); skeleton exposes `handle_connect`; fake mode emits 4 connect events —
+`203.0.113.10:443` and `[2001:db8::1]:443` fire `outbound-connect` MEDIUM,
+`127.0.0.1` and `::1` are silent; every row carries the 3 keys, non-connect rows
+have them zeroed; the HTML report renders both endpoints; full Python suite **67
+tests** (was 61). **Live eBPF load/verifier acceptance is a sudo-only manual step
+for the user.**
+
+**Director review:** Codex (which designed the ABI) reviewed the 11-file diff —
+APPROVED with one should-fix (tighten the ABI asserts to lock field order +
+widths) and one nit (PoC IPv6 `[ip]:port`), both applied and re-approved.
+
+### TASK-A-006 — additive JSONL serialization for every payload
+*Completed 2026-07-26 (with TASK-A-002).* Delivered incrementally: TASK-A-001
+added `old_path`/`new_path`/`flags`/`mode`; TASK-A-002 added
+`addr_family`/`dest_addr`/`dest_port`. Both writers emit every payload
+consistently for alert and non-alert records; all fields are additive and
+back-compatible. CONNECT was the last piece, so this closes with A-002.
+
+
 
 ### TASK-B-005 — HTML report README section-9 conformance
 *Completed 2026-07-25.*

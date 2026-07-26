@@ -6,6 +6,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 struct scenario {
     uint32_t type;
@@ -66,6 +68,42 @@ static struct scenario scenarios[] = {
 
 #define N_SCENARIOS (sizeof(scenarios) / sizeof(scenarios[0]))
 
+/* CONNECT scenarios live in their own table because the payload is a network
+ * destination (family/ip/port), not a filesystem path. Documentation-only
+ * address ranges (RFC 5737 / RFC 3849) so the fake never implies a real host. */
+struct connect_scenario {
+    const char *comm;
+    int32_t addr_family;
+    const char *dest_ip;   // text form, converted with inet_pton at emit time
+    uint16_t dest_port;
+    uint32_t pid, ppid, uid;
+};
+
+static struct connect_scenario connect_scenarios[] = {
+    {"curl",    AF_INET,  "203.0.113.10", 443,  3050, 3000, 1000}, // external -> fires
+    {"curl",    AF_INET6, "2001:db8::1",  443,  3052, 3000, 1000}, // external -> fires
+    {"python3", AF_INET,  "127.0.0.1",    8000, 3051, 3000, 1000}, // IPv4 loopback -> no fire
+    {"python3", AF_INET6, "::1",          8000, 3053, 3000, 1000}, // IPv6 loopback -> no fire
+};
+#define N_CONNECT (sizeof(connect_scenarios) / sizeof(connect_scenarios[0]))
+
+// Run one built event through the rule engine and JSONL writer (shared by the
+// path-based scenarios and the connect scenarios).
+static void fake_emit(FILE *fp, const struct sysguard_event *ev,
+                      const struct sysguard_rule_ctx *rctx,
+                      const char *session_id, const char *project_path,
+                      const char *target_comm) {
+    struct sysguard_alert alert;
+    if (rules_evaluate(ev, rctx, &alert)) {
+        printf("  [%s] %s - %s\n",
+               sysguard_severity_string(alert.severity), alert.rule_id, alert.reason);
+        jsonl_write_alert(fp, ev, &alert, session_id, project_path, target_comm);
+    } else {
+        jsonl_write_event(fp, ev, session_id, project_path, target_comm);
+    }
+    usleep(200000);
+}
+
 void fake_collector_run(const char *output_path,
                         const char *session_id,
                         const char *project_path,
@@ -76,7 +114,8 @@ void fake_collector_run(const char *output_path,
         return;
     }
 
-    printf("[SysGuard] Fake collector started. Generating %zu events...\n", N_SCENARIOS);
+    printf("[SysGuard] Fake collector started. Generating %zu events...\n",
+           N_SCENARIOS + N_CONNECT);
     uint64_t base_ts = (uint64_t)time(NULL) * 1000000000ULL;
     struct sysguard_rule_ctx rctx = { project_path };
 
@@ -122,15 +161,23 @@ void fake_collector_run(const char *output_path,
             break;
         }
 
-        struct sysguard_alert alert;
-        if (rules_evaluate(&ev, &rctx, &alert)) {
-            printf("  [%s] %s - %s\n",
-                   sysguard_severity_string(alert.severity), alert.rule_id, alert.reason);
-            jsonl_write_alert(fp, &ev, &alert, session_id, project_path, target_comm);
-        } else {
-            jsonl_write_event(fp, &ev, session_id, project_path, target_comm);
-        }
-        usleep(200000);
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm);
+    }
+
+    /* CONNECT events (separate table; payload is a network destination). */
+    for (size_t i = 0; i < N_CONNECT; i++) {
+        struct sysguard_event ev = {0};
+        ev.timestamp_ns = base_ts + (N_SCENARIOS + i) * 1000000000ULL;
+        ev.type = SYSGUARD_EVENT_CONNECT;
+        ev.pid  = connect_scenarios[i].pid;
+        ev.ppid = connect_scenarios[i].ppid;
+        ev.uid  = connect_scenarios[i].uid;
+        strncpy(ev.comm, connect_scenarios[i].comm, TASK_COMM_LEN - 1);
+        ev.addr_family = connect_scenarios[i].addr_family;
+        if (connect_scenarios[i].dest_ip && connect_scenarios[i].dest_ip[0])
+            inet_pton(ev.addr_family, connect_scenarios[i].dest_ip, ev.dest_addr);
+        ev.dest_port = connect_scenarios[i].dest_port;
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm);
     }
 
     jsonl_close(fp);

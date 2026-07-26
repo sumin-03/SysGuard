@@ -69,6 +69,12 @@ class SessionSummaryTests(unittest.TestCase):
         self.assertEqual(summary["permission_changes"], [{"path": "mode", "mode": 0o600}])
         self.assertEqual(summary["process_exits"], [{"pid": 4, "comm": "agent"}])
 
+    def test_summary_counts_connect_events(self):
+        summary = session_analyzer.summarize_session([
+            make_event("connect", dest_addr="203.0.113.10", dest_port=443),
+        ])
+        self.assertEqual(summary["event_counts"].get("connect"), 1)
+
     def test_summary_preserves_prior_keys_and_alerts(self):
         events = [
             make_event("execve", argv="python -m unittest", alert=True),

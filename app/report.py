@@ -51,6 +51,12 @@ def format_event_detail(ev: dict) -> str:
         return f"{ev.get('path', '')} mode {mode & 0o7777:04o}"
     if etype == "exit_group":
         return f"pid {ev.get('pid', '')} ({ev.get('comm', '')}) exited"
+    if etype == "connect":
+        addr = ev.get("dest_addr", "")
+        port = ev.get("dest_port", 0)
+        if not addr:
+            return f"connect (family {ev.get('addr_family', 0)})"
+        return f"[{addr}]:{port}" if ":" in addr else f"{addr}:{port}"
     return ev.get("path", "") or ev.get("argv", "") or etype
 
 

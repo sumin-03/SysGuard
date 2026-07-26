@@ -211,3 +211,44 @@ class B005ReportConformanceTests(unittest.TestCase):
         recent = rendered[rendered.index("Recent Events"):]
         self.assertIn(html.escape(hostile), recent)
         self.assertNotIn(hostile, rendered)
+
+
+class A002ConnectReportTests(unittest.TestCase):
+    """CONNECT event rendering + JSONL back-compat (TASK-A-002)."""
+
+    def _render(self, events, status="", diff_stat=""):
+        with mock.patch("report.get_git_summary",
+                        return_value=fake_git_summary(status=status, diff_stat=diff_stat)):
+            with tempfile.TemporaryDirectory() as directory:
+                return read_text(report.generate_report(
+                    write_jsonl(directory, events), project_path="/project"))
+
+    def test_format_event_detail_connect_ipv4_and_ipv6(self):
+        self.assertEqual(
+            report.format_event_detail(
+                make_event("connect", dest_addr="203.0.113.10", dest_port=443)),
+            "203.0.113.10:443")
+        self.assertEqual(
+            report.format_event_detail(
+                make_event("connect", dest_addr="2001:db8::1", dest_port=443)),
+            "[2001:db8::1]:443")
+
+    def test_format_event_detail_connect_missing_address(self):
+        detail = report.format_event_detail(make_event("connect", dest_addr="", addr_family=1))
+        self.assertIn("connect", detail)
+        self.assertIn("family 1", detail)
+
+    def test_connect_alert_endpoint_rendered_in_report(self):
+        rendered = self._render([make_event(
+            "connect", comm="curl", addr_family=2, dest_addr="203.0.113.10",
+            dest_port=443, alert=True, severity="medium",
+            rule_id="outbound-connect", reason="Outbound connection attempt")])
+        self.assertIn("outbound-connect", rendered)
+        self.assertIn("203.0.113.10:443", rendered)
+
+    def test_legacy_jsonl_without_connect_keys_still_renders(self):
+        legacy = {"event": "openat", "path": "/project/a", "pid": 1, "ppid": 0,
+                  "uid": 1, "comm": "claude", "project_path": "/project",
+                  "target_comm": ""}
+        rendered = self._render([legacy])
+        self.assertIn("Commit Safety:", rendered)

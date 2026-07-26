@@ -1,6 +1,9 @@
 #include "rules.h"
 #include <string.h>
 #include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 const char *sysguard_severity_string(enum sysguard_severity severity) {
     switch (severity) {
@@ -87,6 +90,52 @@ static int path_is_inside_project(const char *path, const char *project_path) {
     if (strncmp(path, project_path, rlen) != 0)
         return 0;
     return path[rlen] == '\0' || path[rlen] == '/';
+}
+
+/* True when a CONNECT destination is NOT outbound: an unspecified, loopback, or
+ * link-local address, or a non-IP family. Deliberately does NOT treat RFC1918 /
+ * IPv6 ULA as local — connecting to another host on a private LAN is still
+ * outbound from the monitored process. Operates on the binary dest_addr bytes. */
+static int connect_is_local(const struct sysguard_event *ev) {
+    const unsigned char *a = ev->dest_addr;
+    if (ev->addr_family == AF_INET) {
+        if (a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0) return 1;  /* 0.0.0.0 */
+        if (a[0] == 127) return 1;                        /* 127.0.0.0/8 loopback */
+        if (a[0] == 169 && a[1] == 254) return 1;         /* 169.254/16 link-local */
+        return 0;
+    }
+    if (ev->addr_family == AF_INET6) {
+        int hi_zero = 1;
+        for (int i = 0; i < 15; i++) if (a[i]) { hi_zero = 0; break; }
+        if (hi_zero && a[15] == 0) return 1;              /* :: unspecified */
+        if (hi_zero && a[15] == 1) return 1;              /* ::1 loopback */
+        if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return 1; /* fe80::/10 link-local */
+        return 0;
+    }
+    return 1;  /* AF_UNIX / unsupported / unparsed -> not an outbound IP target */
+}
+
+/* Render a CONNECT destination as "ip:port" (IPv4) or "[ip]:port" (IPv6) for
+ * human-facing reason text. Mirrors the JSONL address renderer. */
+static void format_connect_endpoint(char *dst, size_t sz, const struct sysguard_event *ev) {
+    char ip[64] = "";
+    if (ev->addr_family == AF_INET) {
+        struct in_addr a;
+        memcpy(&a, ev->dest_addr, sizeof(a));
+        if (inet_ntop(AF_INET, &a, ip, sizeof(ip)))
+            snprintf(dst, sz, "%s:%u", ip, (unsigned)ev->dest_port);
+        else
+            snprintf(dst, sz, "(unknown):%u", (unsigned)ev->dest_port);
+    } else if (ev->addr_family == AF_INET6) {
+        struct in6_addr a6;
+        memcpy(&a6, ev->dest_addr, sizeof(a6));
+        if (inet_ntop(AF_INET6, &a6, ip, sizeof(ip)))
+            snprintf(dst, sz, "[%s]:%u", ip, (unsigned)ev->dest_port);
+        else
+            snprintf(dst, sz, "[unknown]:%u", (unsigned)ev->dest_port);
+    } else {
+        snprintf(dst, sz, "(unknown)");
+    }
 }
 
 int rules_evaluate(const struct sysguard_event *ev,
@@ -220,6 +269,23 @@ int rules_evaluate(const struct sysguard_event *ev,
                      (unsigned int)(ev->mode & 07777), ev->path, ev->comm);
             fill_alert(out, ev, "unsafe-chmod", SYSGUARD_SEV_HIGH,
                        reason, "Restrict permissions to the minimum required.");
+            return 1;
+        }
+    }
+
+    if (ev->type == SYSGUARD_EVENT_CONNECT) {
+        /* outbound-connect: an IP connection attempt leaving the local host.
+         * Loopback/link-local/unspecified and non-IP families are excluded.
+         * Captured at syscall entry, so this is an attempt, not a success. */
+        if ((ev->addr_family == AF_INET || ev->addr_family == AF_INET6)
+                && !connect_is_local(ev)) {
+            char endpoint[96], reason[256];
+            format_connect_endpoint(endpoint, sizeof(endpoint), ev);
+            snprintf(reason, sizeof(reason),
+                     "Outbound connection attempt to %s by %s (pid %u)",
+                     endpoint, ev->comm, ev->pid);
+            fill_alert(out, ev, "outbound-connect", SYSGUARD_SEV_MEDIUM,
+                       reason, "Verify the destination and that the connection was intended.");
             return 1;
         }
     }

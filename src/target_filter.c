@@ -87,7 +87,7 @@ static void absolutize_event_paths(struct sysguard_event *e)
         absolutize_field(e->pid, e->new_path);
         break;
     default:
-        break;  // EXEC / EXIT: nothing to normalize.
+        break;  // EXEC / EXIT / CONNECT: no filesystem path to normalize.
     }
 }
 

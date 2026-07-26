@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <bpf/libbpf.h>
 
@@ -31,6 +33,7 @@ static const char *event_type_str(uint32_t type)
     case SYSGUARD_EVENT_UNLINK: return "UNLINK";
     case SYSGUARD_EVENT_RENAME: return "RENAME";
     case SYSGUARD_EVENT_CHMOD:  return "CHMOD";
+    case SYSGUARD_EVENT_CONNECT:return "CONNECT";
     case SYSGUARD_EVENT_EXIT:   return "EXIT";
     default:                    return "UNKNOWN";
     }
@@ -63,6 +66,26 @@ static void print_event(const struct sysguard_event *e, void *ctx)
         printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s\n",
                common, e->pid, e->ppid, e->uid, e->comm);
         break;
+    case SYSGUARD_EVENT_CONNECT: {
+        char ip[64] = "";
+        if (e->addr_family == AF_INET) {
+            struct in_addr a;
+            memcpy(&a, e->dest_addr, sizeof(a));
+            inet_ntop(AF_INET, &a, ip, sizeof(ip));
+        } else if (e->addr_family == AF_INET6) {
+            struct in6_addr a6;
+            memcpy(&a6, e->dest_addr, sizeof(a6));
+            inet_ntop(AF_INET6, &a6, ip, sizeof(ip));
+        }
+        char endpoint[80];
+        if (e->addr_family == AF_INET6)
+            snprintf(endpoint, sizeof(endpoint), "[%s]:%u", ip, (unsigned)e->dest_port);
+        else
+            snprintf(endpoint, sizeof(endpoint), "%s:%u", ip, (unsigned)e->dest_port);
+        printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s dest=%s family=%d\n",
+               common, e->pid, e->ppid, e->uid, e->comm, endpoint, e->addr_family);
+        break;
+    }
     default:  /* EXEC and anything unexpected */
         printf("[%-6s] pid=%-6u ppid=%-6u uid=%-6u comm=%-16s exe=%s argv=[%s]\n",
                common, e->pid, e->ppid, e->uid,

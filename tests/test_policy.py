@@ -167,6 +167,14 @@ class SafetyVerdictTests(unittest.TestCase):
         )
         self.assertEqual(policy.evaluate_commit_safety([event])["safety"], "SAFE")
 
+    def test_standalone_outbound_connect_medium_is_safe(self):
+        event = make_event(
+            "connect", comm="curl", addr_family=2,
+            dest_addr="203.0.113.10", dest_port=443,
+            alert=True, severity="medium", rule_id="outbound-connect",
+        )
+        self.assertEqual(policy.evaluate_commit_safety([event])["safety"], "SAFE")
+
 
 class ReviewNeededTests(unittest.TestCase):
     """README section 7 REVIEW_NEEDED heuristics (TASK-B-003)."""

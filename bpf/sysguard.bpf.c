@@ -9,19 +9,27 @@
 //   renameat2  -> old_path + new_path + rename flags
 //   fchmodat   -> path + mode
 //   exit_group -> process context only (session/subtree end marker)
-// (connect is the remaining README tracepoint; it needs address fields the wire
-// struct does not carry yet, so it is deferred.)
+//   connect    -> addr_family + dest_addr + dest_port (outbound attempt)
 // Collection only — no filtering or verdicts in kernel space; user-space picks
 // the target process and the rule engine decides what is suspicious.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 
 // Shared event contract with user-space (src/event.h). clang ships a
 // freestanding <stdint.h>, so the uintN_t types resolve under -target bpf.
 #include "event.h"
 
 char LICENSE[] SEC("license") = "GPL";
+
+// connect() destination families. Not always present as macros in vmlinux.h.
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
 
 // argv collection limits. Using a CONSTANT per-arg read size lets the BPF
 // verifier prove every write stays in bounds across the unrolled loop: after
@@ -71,6 +79,12 @@ static __always_inline void clear_payload(struct sysguard_event *e)
     e->new_path[0] = '\0';
     e->flags = 0;
     e->mode = 0;
+    /* Binary connect fields: rules + address rendering inspect all bytes, so
+     * (unlike the NUL-terminated strings above) every byte must be cleared. A
+     * 16-byte constant-size memset lowers to a few stores, not a libcall. */
+    e->addr_family = 0;
+    __builtin_memset(e->dest_addr, 0, sizeof(e->dest_addr));
+    e->dest_port = 0;
 }
 
 SEC("tracepoint/syscalls/sys_enter_execve")
@@ -250,6 +264,52 @@ int handle_exit_group(struct trace_event_raw_sys_enter *ctx)
     fill_process_context(e);
     clear_payload(e);
     e->type = SYSGUARD_EVENT_EXIT;
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// connect(int fd, struct sockaddr *uservaddr, int addrlen). We record the
+// destination family/address/port. sockaddr is a variable, family-tagged
+// user-space struct, so read sa_family first, then use CONSTANT-size reads of a
+// fixed stack copy for the IPv4/IPv6 address + port — the verifier can prove
+// every read is bounded. Other families keep only the family. Captured at
+// syscall entry, so this is an *attempted* connection.
+SEC("tracepoint/syscalls/sys_enter_connect")
+int handle_connect(struct trace_event_raw_sys_enter *ctx)
+{
+    struct sysguard_event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    fill_process_context(e);
+    clear_payload(e);
+    e->type = SYSGUARD_EVENT_CONNECT;
+
+    void *uservaddr = (void *)ctx->args[1];
+    int addrlen = (int)ctx->args[2];
+
+    __u16 fam = 0;
+    if (uservaddr && addrlen >= (int)sizeof(fam) &&
+        bpf_probe_read_user(&fam, sizeof(fam), uservaddr) == 0) {
+        e->addr_family = fam;
+
+        if (fam == AF_INET && addrlen >= (int)sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sin;
+            if (bpf_probe_read_user(&sin, sizeof(sin), uservaddr) == 0) {
+                __builtin_memcpy(e->dest_addr, &sin.sin_addr, sizeof(sin.sin_addr));
+                e->dest_port = bpf_ntohs(sin.sin_port);
+            }
+        } else if (fam == AF_INET6 && addrlen >= (int)sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 sin6;
+            if (bpf_probe_read_user(&sin6, sizeof(sin6), uservaddr) == 0) {
+                __builtin_memcpy(e->dest_addr, &sin6.sin6_addr, sizeof(sin6.sin6_addr));
+                e->dest_port = bpf_ntohs(sin6.sin6_port);
+            }
+        }
+    }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
