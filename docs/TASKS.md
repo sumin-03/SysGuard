@@ -31,7 +31,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-A-007 | P1 | **DONE** | Expand `fake_collector` into deterministic coverage of all README event types and all 13 specified rules, including ordered sequence scenarios. |
 | TASK-A-008 | P2 | READY | Add non-root C tests for rule predicates, sequence state, event-name mapping, JSON escaping, payload serialization, and fake-mode schema compatibility. |
 | TASK-A-009 | P2 | READY | Generalize path normalization to UNLINK, CHMOD, and both RENAME paths; document/handle non-AT_FDCWD dirfd-relative paths. *Path-field generalization delivered by TASK-A-001; dirfd handling still open.* |
-| TASK-A-010 | P2 | READY | Reconcile Makefile behavior with README "Build": `make` should produce `build/sysguard.bpf.o`, `build/sysguard.skel.h`, and `build/sysguard`, while preserving focused targets. |
+| TASK-A-010 | P2 | **DONE** | Reconcile Makefile behavior with README "Build": `make` should produce `build/sysguard.bpf.o`, `build/sysguard.skel.h`, and `build/sysguard`, while preserving focused targets. |
 | TASK-A-011 | P2 | READY | Use EXIT events to retire tracked PIDs safely and prevent stale PID membership in long-running target-subtree sessions. *Unblocked by TASK-A-001 (EXIT is now emitted).* |
 | TASK-A-012 | P3 | READY | Update collector comments / stale "optional/MVP-only" wording after the seven-event contract is implemented. *Partially done for the four events added in TASK-A-001.* |
 | TASK-A-013 | P3 | READY | Add build-time ABI assertions and a documented event-contract versioning policy for future shared-struct changes. |
@@ -50,6 +50,28 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-A-010 — Default `make` builds the full engine
+*Completed 2026-07-26.*
+
+Reconciled the Makefile default target with the README "Build" contract (and the
+GUI's "run make first" guidance): plain `make` now produces
+`build/sysguard.bpf.o` + `build/sysguard.skel.h` + the executable
+`build/sysguard`, not just the skeleton.
+
+**File changed (1):** `Makefile` — `all: $(BPF_SKEL)` → `all: $(BIN)` (the
+`$(BIN)` rule already depends on `$(BPF_SKEL)` → `$(BPF_OBJ)`, so all three
+artifacts build through the existing chain — no duplicated prerequisites, no
+recipe on `all`). Refreshed the stale "Week-1 skeleton experiment" header /
+USER_SRC comments. No source/flag/library/artifact-name change; `sysguard`,
+`poc`, `vmlinux`, `run`, `run-poc`, `clean` unchanged.
+
+**Verification (non-sudo):** `make clean && make` builds all three artifacts
+(executable `build/sysguard`); a second `make` is a no-op (`make -q` clean);
+`make sysguard`/`make poc` still work; `make -n run`/`run-poc` still emit their
+sudo commands; fake-mode JSONL parses; full 77-test Python suite green.
+
+**Director review:** Codex reviewed the Makefile diff — APPROVED, no findings.
 
 ### TASK-B-007 — GUI per-session safety preview
 *Completed 2026-07-26.*

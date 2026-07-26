@@ -1,13 +1,14 @@
 # SysGuard Makefile.
 #
-# Week 1 (owner A) targets:
-#   make            -> compile eBPF program + generate libbpf skeleton (skeleton build experiment)
+# Targets:
+#   make            -> build everything: the BPF object, the libbpf skeleton, and
+#                      the full build/sysguard engine (the README "Build" contract).
+#   make sysguard   -> the full build/sysguard binary (same result as the default).
 #   make poc        -> build the standalone collector PoC binary (build/sysguard_poc)
+#   make run        -> build and run the full engine live (needs sudo for BPF load)
 #   make run-poc    -> build and run the PoC (needs sudo for BPF load/attach)
 #   make vmlinux    -> (re)generate bpf/vmlinux.h from the running kernel BTF
-#
-# The full `build/sysguard` binary target is wired but only links once B's
-# modules (main.c, rules.c, fake_collector.c, jsonl_writer.c) exist.
+#   make clean      -> remove build/
 
 CC := clang
 CFLAGS := -Wall -Wextra -O2 -g
@@ -22,7 +23,7 @@ BPF_OBJ := build/sysguard.bpf.o
 BPF_SKEL := build/sysguard.skel.h
 VMLINUX := bpf/vmlinux.h
 
-# Full user-space sources (shared across A/B); used once all modules exist.
+# Full user-space sources (shared across A/B).
 USER_SRC := \
 	src/main.c \
 	src/rules.c \
@@ -41,8 +42,10 @@ LIBS := -lbpf -lelf -lz
 
 .PHONY: all poc vmlinux run-poc sysguard run clean
 
-# Week 1 default: prove the eBPF program compiles and a skeleton is generated.
-all: $(BPF_SKEL)
+# Default: build the BPF object, the skeleton, and the full engine. $(BIN)
+# already depends on $(BPF_SKEL) -> $(BPF_OBJ), so this produces all three
+# README "Build" artifacts through the existing dependency chain.
+all: $(BIN)
 
 # Generate vmlinux.h from the running kernel BTF (required for CO-RE).
 $(VMLINUX):
