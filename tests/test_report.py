@@ -252,3 +252,129 @@ class A002ConnectReportTests(unittest.TestCase):
                   "target_comm": ""}
         rendered = self._render([legacy])
         self.assertIn("Commit Safety:", rendered)
+
+
+class B010AggregationTests(unittest.TestCase):
+    """Report-layer aggregation of repeated rows (TASK-B-010) — display only."""
+
+    def _render(self, events, status="", diff_stat=""):
+        with mock.patch("report.get_git_summary",
+                        return_value=fake_git_summary(status=status, diff_stat=diff_stat)):
+            with tempfile.TemporaryDirectory() as directory:
+                return read_text(report.generate_report(
+                    write_jsonl(directory, events), project_path="/project"))
+
+    # --- pure helper ---
+    def test_helper_empty(self):
+        self.assertEqual(report.aggregate_for_display([], lambda x: x), [])
+
+    def test_helper_counts_and_first_seen_order(self):
+        out = report.aggregate_for_display(["a", "b", "a", "a", "c", "b"], lambda x: x)
+        self.assertEqual(out, [("a", 3), ("b", 2), ("c", 1)])
+
+    def test_helper_representative_is_first_and_no_mutation(self):
+        items = [{"k": 1, "v": "first"}, {"k": 1, "v": "second"}]
+        snapshot = [dict(d) for d in items]
+        out = report.aggregate_for_display(items, lambda d: d["k"])
+        self.assertEqual(out[0][0]["v"], "first")
+        self.assertEqual(out[0][1], 2)
+        self.assertEqual(items, snapshot)  # inputs untouched
+
+    # --- alert aggregation ---
+    def _alert(self, **over):
+        base = dict(event="execve", path="/usr/bin/curl", argv="curl http://x",
+                    alert=True, severity="medium", rule_id="downloader-exec",
+                    reason="Downloader executed", pid=100, ppid=1, uid=1,
+                    comm="bash", project_path="/project", target_comm="")
+        base.update(over)
+        return base
+
+    def test_identical_alerts_collapse_to_one_row_with_count(self):
+        rendered = self._render([self._alert() for _ in range(20)])
+        self.assertIn("&times;20", rendered)                    # aggregated marker
+        self.assertEqual(rendered.count("downloader-exec"), 1)  # one alert row
+        self.assertIn("Total Events</td><td>20</td>", rendered)  # raw metadata kept
+        self.assertIn("Alerts</td><td>20</td>", rendered)
+
+    def test_distinct_alerts_stay_separate(self):
+        events = [
+            self._alert(rule_id="destructive-rm", argv="rm -rf a", reason="r1", pid=1, comm="bash", severity="high"),
+            self._alert(rule_id="git-reset-hard", argv="git reset --hard", reason="r2", pid=1, comm="bash", severity="high"),
+            self._alert(rule_id="destructive-rm", argv="rm -rf a", reason="r1", pid=1, comm="sh", severity="high"),   # diff comm
+            self._alert(rule_id="destructive-rm", argv="rm -rf a", reason="r1", pid=2, comm="bash", severity="high"), # diff pid
+        ]
+        rendered = self._render(events)
+        # Count within the Alert Details section only (Recent Events is a raw,
+        # unaggregated tail and also shows these events).
+        alert_region = rendered[rendered.index("Alert Details"):rendered.index("Recent Events")]
+        self.assertEqual(alert_region.count("<td>rm -rf a</td>"), 3)  # not merged (comm/pid differ)
+        self.assertIn("git-reset-hard", rendered)
+        self.assertNotIn("&times;", alert_region)                # all distinct -> no counts
+
+    def test_each_alert_key_field_independently_prevents_collapse(self):
+        # base + a variant differing in EXACTLY one key field must NOT collapse.
+        # Varying each field alone catches a regression that drops any single
+        # field from _alert_key.
+        base = dict(severity="high", rule_id="destructive-rm", argv="rm -rf a",
+                    reason="r", pid=1, comm="bash")
+        variants = {
+            "severity": dict(base, severity="medium"),
+            "rule_id":  dict(base, rule_id="git-reset-hard"),
+            "pid":      dict(base, pid=2),
+            "comm":     dict(base, comm="sh"),
+            "detail":   dict(base, argv="rm -rf b"),   # changes format_event_detail
+            "reason":   dict(base, reason="different"),
+        }
+        for field, variant in variants.items():
+            with self.subTest(field=field):
+                rendered = self._render([self._alert(**base), self._alert(**variant)])
+                region = rendered[rendered.index("Alert Details"):rendered.index("Recent Events")]
+                # two distinct alerts -> two separate rows, never a "×2"
+                self.assertNotIn("&times;", region)
+
+    # --- normal activity ---
+    def test_repeated_normal_command_collapses(self):
+        rendered = self._render([make_event("execve", argv="git status") for _ in range(5)])
+        self.assertEqual(rendered.count("<code>git status</code>"), 1)
+        self.assertIn("&times;5", rendered)
+
+    def test_normal_activity_aggregates_before_20_cap(self):
+        events = [make_event("execve", argv="dup") for _ in range(25)]
+        events.append(make_event("execve", argv="unique_cmd"))
+        rendered = self._render(events)
+        self.assertIn("unique_cmd", rendered)   # not pushed past the 20-cap by 25 dups
+        self.assertIn("&times;25", rendered)
+
+    # --- recent events NOT aggregated ---
+    def test_recent_events_not_aggregated(self):
+        rendered = self._render([make_event("openat", path="/project/same.py") for _ in range(4)])
+        recent = rendered[rendered.index("Recent Events"):]
+        self.assertEqual(recent.count("/project/same.py"), 4)   # raw 4 rows, not collapsed
+
+    # --- verdict integrity ---
+    def test_aggregation_does_not_change_verdict_badge(self):
+        import re
+        events = [self._alert() for _ in range(15)]
+
+        def badge(html_text):
+            return re.search(r'<div class="safety-badge">.*?</div>', html_text).group(0)
+
+        agg = self._render(events)
+        with mock.patch("report.aggregate_for_display",
+                        side_effect=lambda items, key_fn: [(i, 1) for i in items]):
+            noagg = self._render(events)
+        self.assertEqual(badge(agg), badge(noagg))               # verdict badge identical
+        self.assertIn("Total Events</td><td>15</td>", agg)
+        self.assertIn("Total Events</td><td>15</td>", noagg)
+
+    # --- escaping ---
+    def test_repeated_hostile_value_escaped_once_with_count(self):
+        hostile = "<script>x</script>"
+        rendered = self._render([make_event("execve", argv=hostile) for _ in range(3)])
+        # In Normal Activity the 3 duplicates collapse to a SINGLE escaped row
+        # + a safe count (no double-escaping / duplicate rendering there).
+        normal = rendered[rendered.index("Normal Development Activity"):
+                          rendered.index("Boundary Violations")]
+        self.assertEqual(normal.count(html.escape(hostile)), 1)
+        self.assertIn("&times;3", normal)
+        self.assertNotIn(hostile, rendered)   # raw markup never appears anywhere

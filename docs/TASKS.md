@@ -44,12 +44,50 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-007 | P2 | **DONE** | Add the README-promised per-session safety-result preview to the GUI session list/panel. |
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
+| TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
 
-**All 13 README canonical rules are now implemented (13/13).** Remaining work is P2/P3 polish/infra only: TASK-A-008 (C tests), TASK-A-009 (dirfd paths), TASK-A-010 (Makefile), TASK-A-011 (EXIT-based PID retirement), TASK-A-012 (comments), TASK-A-013 (ABI version policy — partly seeded by A-002's `_Static_assert`s), TASK-B-007 (GUI safety preview), TASK-B-008 (git safe-empty), TASK-B-009 (malformed-JSONL counts). Merging the branch to `main` + pushing is also available.
+**All 13 README canonical rules are implemented (13/13).** Remaining is P2/P3 polish/infra only: TASK-A-008 (C tests), TASK-A-009 (dirfd paths), TASK-A-011 (EXIT-based PID retirement), TASK-A-012 (comments), TASK-A-013 (ABI version policy — partly seeded by A-002's `_Static_assert`s), TASK-B-008 (git safe-empty), TASK-B-009 (malformed-JSONL counts). DONE beyond the README gap: TASK-B-010 (report aggregation). *(A-010, B-007 already DONE.)*
 
 ---
 
 ## Completed
+
+### TASK-B-010 — Report-layer aggregation of repeated rows
+*Completed 2026-07-27. (User-reported UX issue, outside the original README-gap backlog.)*
+
+A single logical action produces many syscalls, and repeated commands/opens
+produced many near-identical rows, cluttering the HTML report. B-010 collapses
+repeated **display** rows into one row + a `×N` occurrence count — a
+**display-only** change that never touches collection, the raw JSONL evidence,
+or the Commit Safety verdict.
+
+**Files changed (1 + tests):** `app/report.py` (+ `tests/test_report.py`).
+- Pure helper `aggregate_for_display(items, key_fn) -> [(first_item, count)]`
+  (first-seen order, no mutation/escape/HTML/timestamp/policy) + `_count_suffix`.
+- **Alert Details:** identical rows collapse; new "Occurrences" column (`×N`,
+  `—` for 1). Key = `(severity, rule_id, pid, comm, format_event_detail, reason)`
+  so different-importance / different-process alerts never merge.
+- **Normal Activity** (commands/files/deletions/renames/chmods/exits): aggregate
+  FIRST, then cap at 20 unique rows (repeated early activity can't hide later
+  distinct activity), each with a `×N` suffix.
+- **Recent Events** and the policy finding subsections stay **unaggregated**
+  (raw tail / small policy-derived lists).
+- Metadata `Total Events` / `Alerts` still show raw counts.
+
+**Design guardrails:** aggregation runs only at render time, after
+`evaluate_commit_safety` over the full event list — so the verdict/badge is
+unchanged (a test asserts the badge HTML is byte-identical with vs without
+aggregation). All values escaped at the render boundary; the `×N` markup is
+static. No monotonic `timestamp_ns` is rendered.
+
+**Verification (non-sudo):** full suite **88 tests** (was 77, +11); a live
+report over a crafted 30×-duplicate-alert session collapses to one `×30` row +
+raw metadata (31/31), and the input JSONL sha256 is unchanged before/after
+report generation.
+
+**Director review:** Codex (which planned it) reviewed the diff — APPROVED, no
+blocker/should-fix; three nits (per-field distinct-alert test, escaped-once
+scoping, docstring wording) applied.
 
 ### TASK-A-010 — Default `make` builds the full engine
 *Completed 2026-07-26.*

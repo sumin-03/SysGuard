@@ -22,12 +22,46 @@ SEV_COLORS = {
 }
 
 
+def aggregate_for_display(items, key_fn):
+    """Group display items by ``key_fn``, preserving first-seen order.
+
+    Returns a list of ``(representative_item, count)`` — the representative is
+    the FIRST item seen for each key; later matches only bump the count. Pure
+    and render-only: it does not mutate the inputs or their dicts, escape, emit
+    HTML, read timestamps, or touch policy. Aggregation is applied ONLY when
+    rendering, after the Commit Safety verdict has been computed over the full
+    event list, so it can never change the verdict.
+    """
+    order = []
+    buckets = {}
+    for item in items:
+        k = key_fn(item)
+        entry = buckets.get(k)
+        if entry is None:
+            entry = [item, 1]
+            buckets[k] = entry
+            order.append(entry)
+        else:
+            entry[1] += 1
+    return [(item, count) for item, count in order]
+
+
+def _count_suffix(count):
+    """Static, injection-safe ' ×N' marker (empty for a single occurrence).
+
+    ``count`` is an internally derived integer, so the markup carries no
+    event-derived data and needs no escaping."""
+    return f' <span class="count">&times;{count}</span>' if count > 1 else ""
+
+
 def format_event_detail(ev: dict) -> str:
     """Event-aware, human-readable detail for one event.
 
     Returns RAW text — every caller must html.escape() the result. Covers all
-    six event types the C engine emits so rename/chmod/unlink/exit rows are
-    never blank (renameat2 leaves `path` empty by design).
+    seven event types the C engine emits (execve/openat/unlinkat/renameat2/
+    fchmodat/exit_group/connect) so mutation/exit/connect rows render
+    meaningfully rather than blank. (A degenerate event with no argv/path can
+    still format to an empty string.)
     """
     etype = ev.get("event", "")
     if etype == "execve":
@@ -104,6 +138,7 @@ h1 {{ color: #1a3a5c; font-size: 1.8rem; margin-bottom: 0.3rem; }}
   border-bottom: 2px solid #e9ecef; padding-bottom: 0.4rem; }}
 .section h3 {{ color: #1a3a5c; font-size: 0.95rem; margin: 0.9rem 0 0.4rem; }}
 .empty {{ color: #888; font-style: italic; }}
+.count {{ color: #888; font-size: 0.82em; font-weight: bold; }}
 ul {{ padding-left: 1.2rem; }}
 li {{ margin-bottom: 0.3rem; }}
 table {{ border-collapse: collapse; width: 100%; margin-top: 0.5rem; }}
@@ -144,15 +179,17 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     h += '<div class="section"><h2>&#9989; Normal Development Activity</h2>\n'
     normal_cmds = [e.get("argv","") for e in events if e.get("event")=="execve" and not e.get("alert")]
     normal_files = [e.get("path","") for e in events if e.get("event")=="openat" and not e.get("alert")]
+    # Aggregate repeated entries into one row + a ×N count, THEN cap at 20 unique
+    # rows (so repeated early activity doesn't hide later distinct activity).
     if normal_cmds:
         h += "<ul>\n"
-        for c in normal_cmds[:20]:
-            h += f"  <li><code>{html.escape(c)}</code></li>\n"
+        for c, n in aggregate_for_display(normal_cmds, lambda s: s)[:20]:
+            h += f"  <li><code>{html.escape(c)}</code>{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     if normal_files:
         h += "<p><b>Files:</b></p><ul>\n"
-        for f in normal_files[:20]:
-            h += f"  <li>{html.escape(f)}</li>\n"
+        for f, n in aggregate_for_display(normal_files, lambda s: s)[:20]:
+            h += f"  <li>{html.escape(f)}{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     # File-mutation evidence that did not raise an alert (renames, safe chmods,
     # exits, and any non-alerting deletion) — event-aware so nothing is blank.
@@ -162,23 +199,23 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     exits          = [e for e in events if e.get("event") == "exit_group"]
     if normal_deletes:
         h += "<p><b>Deletions:</b></p><ul>\n"
-        for e in normal_deletes[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        for e, n in aggregate_for_display(normal_deletes, format_event_detail)[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     if normal_renames:
         h += "<p><b>Renames:</b></p><ul>\n"
-        for e in normal_renames[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        for e, n in aggregate_for_display(normal_renames, format_event_detail)[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     if normal_chmods:
         h += "<p><b>Permission changes:</b></p><ul>\n"
-        for e in normal_chmods[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        for e, n in aggregate_for_display(normal_chmods, format_event_detail)[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     if exits:
         h += "<p><b>Process exits:</b></p><ul>\n"
-        for e in exits[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}</li>\n"
+        for e, n in aggregate_for_display(exits, format_event_detail)[:20]:
+            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
         h += "</ul>\n"
     if not (normal_cmds or normal_files or normal_renames
             or normal_chmods or normal_deletes or exits):
@@ -235,17 +272,27 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
                         or safety.get("file_deletions") or safety.get("review_findings"))
     h += '<div class="section"><h2>&#128680; Alert Details</h2>\n'
     if alerts:
+        # Collapse identical alert rows into one + an occurrence count. The key
+        # keeps severity and PID so different-importance / different-process
+        # alerts never merge, while the same curl alert emitted N times by one
+        # process becomes a single ×N row.
+        def _alert_key(a):
+            return (a.get("severity", ""), a.get("rule_id", ""), a.get("pid", ""),
+                    a.get("comm", ""), format_event_detail(a), a.get("reason", ""))
         h += "<table>\n"
-        h += "<tr><th>Severity</th><th>Rule</th><th>PID</th><th>Comm</th><th>Path/Argv</th><th>Reason</th></tr>\n"
-        for a in alerts:
+        h += ("<tr><th>Severity</th><th>Rule</th><th>PID</th><th>Comm</th>"
+              "<th>Path/Argv</th><th>Reason</th><th>Occurrences</th></tr>\n")
+        for a, n in aggregate_for_display(alerts, _alert_key):
             sev = a.get("severity", "")
             sc = SEV_COLORS.get(sev, "#666")
+            occ = f"&times;{n}" if n > 1 else "&mdash;"
             h += (f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
                   f"<td>{html.escape(a.get('rule_id',''))}</td>"
                   f"<td>{html.escape(str(a.get('pid','')))}</td>"
                   f"<td>{html.escape(a.get('comm',''))}</td>"
                   f"<td>{html.escape(format_event_detail(a))}</td>"
-                  f"<td>{html.escape(a.get('reason',''))}</td></tr>\n")
+                  f"<td>{html.escape(a.get('reason',''))}</td>"
+                  f"<td>{occ}</td></tr>\n")
         h += "</table>\n"
     if safety.get("suspicious_sequences"):
         h += '<h3>&#128680; Suspicious Sequences</h3><ul>\n'
