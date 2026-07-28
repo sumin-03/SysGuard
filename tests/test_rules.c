@@ -144,6 +144,9 @@ int main(void)
         HOME "/.claude/projects/s.jsonl", HOME "/.claude/sessions/1.json",
         HOME "/.claude/backups/b", HOME "/.claude/history.jsonl",
         HOME "/.claude/file-history/uuid/6ccb9ea1740990e8@v2",
+        HOME "/.claude/jobs/6a96f49b/timeline.jsonl",
+        HOME "/.claude/jobs/6a96f49b/state.json.tmp.ed3aa3b4",
+        HOME "/.claude/jobs/pins.json",
         HOME "/.claude/session-env/x/hook.sh", HOME "/.claude/plugins/cache/p",
         HOME "/.npm/_cacache/x", HOME "/.npm/_logs/x.log",
         HOME "/.cache/claude-cli-nodejs/x.jsonl", HOME "/.config/Code/logs/x/cli.log",
@@ -162,6 +165,9 @@ int main(void)
     const char *near_miss[] = {
         HOME "/.npmrc", HOME "/.cache/other/x", HOME "/evil.tmp",
         HOME "/.claude/plugins/evil", HOME "/.claude/x",
+        HOME "/.claude/jobs/x/payload",
+        HOME "/.claude/jobs/x/y/timeline.jsonl",
+        HOME "/.claude/jobs/evil.json",
         HOME "/.claude.json.tmp.notapid.zz",     /* malformed staging name */
         "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
         "/tmp/claude-evil/x",        /* not numeric -> no exemption */

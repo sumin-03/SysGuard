@@ -194,6 +194,35 @@ static int is_tmp_agent_scratch(const char *path, uint32_t uid) {
     return hex >= 4 && hex <= 16 && strcmp(a, "-cwd") == 0;
 }
 
+/* Background-job bookkeeping under ".claude/jobs/": "pins.json", or
+ * "<job>/timeline.jsonl" / "<job>/state.json[.tmp.<hex>]". Matched as specific
+ * files, NOT as a subtree, so ".claude/jobs/x/payload" stays reportable.
+ * Mirrors _CLAUDE_JOBS_RE in app/policy.py. */
+static int is_claude_jobs_file(const char *rel) {
+    static const char *pfx = ".claude/jobs/";
+    size_t plen = strlen(pfx);
+    if (strncmp(rel, pfx, plen) != 0) return 0;
+    const char *p = rel + plen;
+    if (strcmp(p, "pins.json") == 0) return 1;
+    const char *slash = strchr(p, '/');
+    if (!slash || slash == p) return 0;          /* need a <job> component */
+    const char *file = slash + 1;
+    if (!*file || strchr(file, '/')) return 0;   /* exactly one more component */
+    if (strcmp(file, "timeline.jsonl") == 0) return 1;
+    if (strcmp(file, "state.json") == 0) return 1;
+    static const char *sp = "state.json.tmp.";
+    size_t splen = strlen(sp);
+    if (strncmp(file, sp, splen) != 0) return 0;
+    const char *h = file + splen;
+    if (!*h) return 0;
+    for (; *h; h++) {
+        int hex = (*h >= '0' && *h <= '9') || (*h >= 'a' && *h <= 'f') ||
+                  (*h >= 'A' && *h <= 'F');
+        if (!hex) return 0;
+    }
+    return 1;
+}
+
 /* .claude.json.tmp.<decimal-pid>.<hex> directly under home (atomic staging). */
 static int is_claude_json_tmp(const char *rel) {
     static const char *pfx = ".claude.json.tmp.";
@@ -314,6 +343,8 @@ static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ct
     if (str_in(rel, runtime_noise_home_exact, ARRAY_LEN(runtime_noise_home_exact)))
         return 1;
     if (!strchr(rel, '/') && is_claude_json_tmp(rel))
+        return 1;
+    if (is_claude_jobs_file(rel))
         return 1;
     return has_prefix_in(rel, runtime_noise_home_prefixes, ARRAY_LEN(runtime_noise_home_prefixes));
 }

@@ -391,6 +391,10 @@ class B012EffectAwareWriteTests(unittest.TestCase):
             "/home/u/.claude/projects/s.jsonl", "/home/u/.claude/sessions/1.json",
             "/home/u/.claude/backups/b", "/home/u/.claude/history.jsonl",
             "/home/u/.claude/file-history/uuid/6ccb9ea1740990e8@v2",
+            "/home/u/.claude/jobs/6a96f49b/timeline.jsonl",
+            "/home/u/.claude/jobs/6a96f49b/state.json",
+            "/home/u/.claude/jobs/6a96f49b/state.json.tmp.ed3aa3b4",
+            "/home/u/.claude/jobs/pins.json",
             "/home/u/.claude/session-env/x/hook.sh", "/home/u/.claude/plugins/cache/p",
             "/home/u/.npm/_cacache/x", "/home/u/.npm/_logs/x.log",
             "/home/u/.cache/claude-cli-nodejs/x.jsonl",
@@ -411,6 +415,9 @@ class B012EffectAwareWriteTests(unittest.TestCase):
         for p in [
             "/home/u/.npmrc", "/home/u/.cache/other/x", "/home/u/evil.tmp",
             "/home/u/.claude/plugins/evil", "/home/u/.claude/x",
+            "/home/u/.claude/jobs/x/payload",        # not a known job file
+            "/home/u/.claude/jobs/x/y/timeline.jsonl",  # too deeply nested
+            "/home/u/.claude/jobs/evil.json",        # only pins.json at this level
             "/home/u/.claude.json.tmp.notapid.zz",
             "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
             "/usr/lib/x.so",
@@ -827,3 +834,13 @@ class B015ToolTmpTests(unittest.TestCase):
                 self.assertFalse(policy.path_in_tool_tmp("/tmp/payload", bad))
                 r = self._verdict([self._open("/tmp/payload")], root=bad)
                 self.assertEqual(r["safety"], "REVIEW_NEEDED")
+
+    def test_trailing_newline_never_wins_an_exemption(self):
+        # Python's "$" also matches before a trailing newline; the C engine uses
+        # strcmp, so a lenient anchor would split the two classifications.
+        for p in ["/home/u/.claude/jobs/x/state.json\n",
+                  "/home/u/.claude/jobs/pins.json\n",
+                  "/home/u/.claude.json.tmp.42.ab\n",
+                  "/tmp/claude-c8bd-cwd\n"]:
+            with self.subTest(path=p):
+                self.assertFalse(policy.is_runtime_noise_write(p, "/home/u", self.UID))

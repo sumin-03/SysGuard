@@ -54,13 +54,23 @@ RUNTIME_NOISE_ABS_EXACT = (
 # caught by their own rules regardless of location, and a staged file renamed
 # onto a protected/persistence target is caught by the rename rule.
 _TMP_AGENT_DIR_RE = re.compile(r"^/tmp/claude-([0-9]+)/")
-_TMP_AGENT_CWD_RE = re.compile(r"^/tmp/claude-[0-9a-f]{4,16}-cwd$")
+_TMP_AGENT_CWD_RE = re.compile(r"/tmp/claude-[0-9a-f]{4,16}-cwd")
 # renameat2 RENAME_EXCHANGE: the two paths are SWAPPED, so both are mutated.
 # (linux/fs.h; not exposed by Python's os module.)
 RENAME_EXCHANGE = 1 << 1
 
+# Background-job bookkeeping under ~/.claude/jobs/. Matched as specific files,
+# NOT as a subtree: an open ".claude/jobs/" would let any process hide writes at
+# ".claude/jobs/x/payload".
+# NOTE: matched with fullmatch() — "$" would also match before a trailing
+# newline, so "jobs/x/state.json\n" would be exempted here while the C engine
+# (strcmp) rejects it, splitting real-time and report classification.
+_CLAUDE_JOBS_RE = re.compile(
+    r"\.claude/jobs/(pins\.json"
+    r"|[^/]+/(state\.json(\.tmp\.[0-9A-Fa-f]+)?|timeline\.jsonl))")
+
 # Atomic config staging file directly under home: .claude.json.tmp.<pid>.<hex>.
-_CLAUDE_JSON_TMP_RE = re.compile(r"^\.claude\.json\.tmp\.[0-9]+\.[0-9A-Fa-f]+$")
+_CLAUDE_JSON_TMP_RE = re.compile(r"\.claude\.json\.tmp\.[0-9]+\.[0-9A-Fa-f]+")
 
 # Deletion is NOT the same as writing. The write-noise set above must not be
 # reused wholesale for unlinkat: deleting ~/.claude/history.jsonl, backups/ or
@@ -297,7 +307,9 @@ def is_runtime_noise_write(path: str, home_path, uid=None, tool_tmp=None) -> boo
         return False
     if rel in RUNTIME_NOISE_HOME_EXACT:
         return True
-    if "/" not in rel and _CLAUDE_JSON_TMP_RE.match(rel):
+    if "/" not in rel and _CLAUDE_JSON_TMP_RE.fullmatch(rel):
+        return True
+    if _CLAUDE_JOBS_RE.fullmatch(rel):
         return True
     return any(rel.startswith(pfx) for pfx in RUNTIME_NOISE_HOME_PREFIXES)
 
@@ -322,7 +334,7 @@ def is_agent_tmp_scratch(path: str, uid=None) -> bool:
         except (TypeError, ValueError):
             return False
         return not _tmp_path_is_redirected(path)
-    if _TMP_AGENT_CWD_RE.match(path):
+    if _TMP_AGENT_CWD_RE.fullmatch(path):
         return not _tmp_path_is_redirected(path)
     return False
 
@@ -344,7 +356,7 @@ def is_runtime_noise_deletion(path: str, home_path, uid=None, tool_tmp=None) -> 
     rel = _home_rel(path, home_path)
     if rel is None:
         return False
-    if "/" not in rel and _CLAUDE_JSON_TMP_RE.match(rel):
+    if "/" not in rel and _CLAUDE_JSON_TMP_RE.fullmatch(rel):
         return True
     return any(rel.startswith(p) for p in RUNTIME_NOISE_DELETION_HOME_PREFIXES)
 
