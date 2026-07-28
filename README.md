@@ -169,12 +169,16 @@ config/secrets.json
 
 > **`~/.claude` 안이라고 전부 안전한 것은 아니다.** 같은 디렉터리라도 *기록물*(세션 상태·스냅샷·캐시)은 노이즈지만, *설정*인 `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json`은 **hook과 MCP 서버를 정의**하므로 쓰기 시 다음 실행부터 임의 명령이 자동 실행된다. 이 세 파일은 persistence로 분류되어 `UNSAFE`를 유지한다 — prompt injection을 당한 agent가 자기 설정에 backdoor를 심는 것이 이 도구가 잡아야 할 대표적 공격이기 때문이다.
 - project 밖 **그 외 write/create**: `outside-project-write` (검토 대상).
+- **삭제(`unlinkat`)도 open과 같은 우선순위**를 따른다: protected 삭제 → `UNSAFE`, persistence/활성화 대상 삭제 → `UNSAFE`(지워진 `authorized_keys`나 shell rc도 다음 실행 동작을 바꾼다), 처분 가능한 런타임 산출물 삭제 → 정보성, 그 외 → 검토. **삭제 면제 집합은 쓰기보다 좁다** — `~/.claude/history.jsonl`·`backups/`·`file-history/` 삭제는 파괴적이고 `/dev/null`을 unlink하는 건 bookkeeping이 아니므로, 자기 uid scratch·staging·재생성 가능한 캐시/로그만 면제한다.
+- **`renameat2`는 목적지 기준**으로 protected → persistence → 일반 outside 순으로 분류한다. 면제된 임시 위치에 staging 후 `/tmp/payload`로 rename하는 우회를 막기 위함이다.
 - project 밖 **비민감 읽기**: 정보성(위반 아님). 리포트에 건수와 소량의 sample path만 요약한다.
 - flags가 없는 legacy record: operation unknown으로 별도 집계하고 **면제하지 않는다**(쓰기를 배제할 수 없으므로 `REVIEW_NEEDED`).
 
 system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지하며, **쓰기에는 적용하지 않는다**(`/usr`·`/etc`·`/opt`에 쓰는 것은 변조 신호).
 
 **심볼릭 링크 — 미해결 한계(정직하게 명시).** 두 엔진 모두 경로를 **lexical**하게 매칭한다. C 엔진은 실시간 hot path라 매 이벤트를 `realpath`할 수 없고, Python은 세션이 끝난 뒤 실행되므로 **이벤트 시점의 링크 상태를 증명할 수 없다.** 따라서 면제 대상처럼 보이는 경로(`/tmp/claude-<uid>/x`든 `~/.claude/projects/x`든)를 민감한 대상으로 링크해두고 쓴 뒤 링크를 지우면, 리포트는 이를 런타임 노이즈로 분류할 수 있다. Python 쪽에 `realpath` 대조를 넣어 **실행 중 남아 있는 링크는 면제를 거부**하지만 이는 defence-in-depth일 뿐 보장이 아니다. 근본 해결은 collector가 **이벤트 시점에 resolve된 대상 경로를 기록**하는 것이며 `TASK-A-014`로 등록했다.
+
+**빌드 toolchain 임시 파일은 의도적으로 면제하지 않는다.** `gcc`는 컴파일 중 `/tmp/ccXXXXXX.s|.o|.res|.cdtor.*` 중간 산출물을 만들므로 C 프로젝트를 빌드한 세션은 `outside-project-write`가 뜬다. 이를 **파일명 패턴이나 `comm`으로 면제하지 않는 이유**: `comm`은 위조 가능하고, 진짜 `gcc`/`as`/`ld`도 호출자가 지정한 경로에 쓸 수 있으며, 파일 이벤트에는 검증된 실행 파일 신원이 없다(`exe_path`는 `execve`에만 존재). 즉 `/tmp/ccevil.o` 같은 payload와 진짜 컴파일러 임시 파일을 정적 규칙으로 구분할 수 없다. 근본 해결은 세션마다 예측 불가능한 `0700` 임시 루트를 만들어 `TMPDIR`로 넘기고 **그 루트만** 면제하는 것인데, SysGuard는 agent를 실행하지 않고 관찰만 하므로 현재 구조에서는 `TMPDIR`을 통제할 수 없다. 따라서 **오탐을 감수하고 사실대로 보고**한다 — 빌드가 project 밖에 쓴 것은 사실이기 때문이다.
 
 **알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`·`~/.claude/shell-snapshots/`(둘 다 이후 셸에서 source되는 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
 

@@ -71,6 +71,19 @@ static struct sysguard_event mk_rename(const char *old_path, const char *new_pat
     return e;
 }
 
+static struct sysguard_event mk_unlink(const char *path, uint32_t uid)
+{
+    struct sysguard_event e;
+    memset(&e, 0, sizeof(e));
+    e.type = SYSGUARD_EVENT_UNLINK;
+    e.pid = 100;
+    e.ppid = 1;
+    e.uid = uid;
+    strncpy(e.comm, "rm", sizeof(e.comm) - 1);
+    strncpy(e.path, path, sizeof(e.path) - 1);
+    return e;
+}
+
 static int is(const char *got, const char *want)
 {
     return got && strcmp(got, want) == 0;
@@ -237,6 +250,76 @@ int main(void)
     /* Absolute no-op sinks likewise stay exempt without a home. */
     e = mk_open("/dev/null", O_WRONLY);
     CHECK(rule_of_nohome(&e, P) == NULL);
+
+    /* ---- TASK-B-014: deletion precedence (mirrors tests/test_policy.py) ---- */
+
+    /* Compiler intermediates under /tmp are NOT exempt: recognizing forgeable
+     * gcc temp filenames would be an attacker-controllable allowlist. */
+    e = mk_open("/tmp/ccQ3Au8q.s", O_WRONLY | O_CREAT);
+    strncpy(e.comm, "cc1", sizeof(e.comm) - 1);
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
+
+    /* Deleting the agent's OWN uid-scoped scratch is disposable -> no alert. */
+    e = mk_unlink("/tmp/claude-1000/-home-u-proj/uuid/scratchpad/hello", 1000);
+    CHECK(rule_of(&e, P) == NULL);
+    /* ...but another uid's directory is not the writer's own scratch. */
+    e = mk_unlink("/tmp/claude-9999/-home-u-proj/uuid/scratchpad/hello", 1000);
+    CHECK(is(rule_of(&e, P), "file-unlink"));
+
+    /* Protected and persistence precedence applies to deletions too. */
+    e = mk_unlink("/project/.env", 1000);
+    CHECK(is(rule_of(&e, P), "env-file-access"));
+    e = mk_unlink(HOME "/.bashrc", 1000);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_unlink(HOME "/.ssh/authorized_keys", 1000);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+
+    /* The WRITE allowlist is not reused wholesale: deleting history/backups is
+     * destructive and stays reviewable. */
+    e = mk_unlink(HOME "/.claude/history.jsonl", 1000);
+    CHECK(is(rule_of(&e, P), "file-unlink"));
+    e = mk_unlink(HOME "/.claude/backups/b", 1000);
+    CHECK(is(rule_of(&e, P), "file-unlink"));
+    e = mk_unlink("/dev/null", 1000);
+    CHECK(is(rule_of(&e, P), "file-unlink"));
+    /* Caches/logs the agent recreates freely are disposable. */
+    e = mk_unlink(HOME "/.npm/_logs/x.log", 1000);
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* In-project source deletion stays reviewable. */
+    e = mk_unlink("/project/docs/hello.c", 1000);
+    CHECK(is(rule_of(&e, P), "file-unlink"));
+
+    /* RENAME_EXCHANGE swaps both files, so old_path is a destination too: an
+     * exchange must not hide a sensitive target behind a benign new_path. */
+    e = mk_rename(HOME "/.bashrc", "/project/benign.txt");
+    e.flags = (1 << 1);   /* RENAME_EXCHANGE */
+    e.uid = 1000;
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename("/project/.env", "/project/benign.txt");
+    e.flags = (1 << 1);
+    e.uid = 1000;
+    CHECK(is(rule_of(&e, P), "env-file-access"));
+    /* Severity must win over target order: an ordinary outside new_path must
+     * not mask a critical old_path on the other side of the exchange. */
+    e = mk_rename(HOME "/.bashrc", "/tmp/ordinary-outside");
+    e.flags = (1 << 1);
+    e.uid = 1000;
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename("/project/.env", "/tmp/ordinary-outside");
+    e.flags = (1 << 1);
+    e.uid = 1000;
+    CHECK(is(rule_of(&e, P), "env-file-access"));
+
+    /* Without the flag, only the destination matters (plain rename). */
+    e = mk_rename(HOME "/.bashrc", "/project/benign.txt");
+    e.uid = 1000;
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* Rename to an ordinary outside destination is an outside write. */
+    e = mk_rename("/tmp/claude-1000/stage", "/tmp/payload");
+    e.uid = 1000;
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
 
     if (failures == 0) {
         printf("C rule tests: all passed\n");

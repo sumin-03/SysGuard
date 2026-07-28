@@ -46,6 +46,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 | TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
 | TASK-A-014 | P2 | READY | Record collector-resolved (symlink-resolved) target paths at event time. Both engines match paths lexically today — C cannot `realpath` in the real-time hot path and Python runs after the session, so a symlink created and removed during the run can make an exempt-looking path (`/tmp/claude-<uid>/x`, `~/.claude/projects/x`, ...) resolve to a persistence target and be classified as runtime noise. Resolving in the collector is the sound fix; the Python `realpath` cross-check is only defence in depth. *Raised by the director during the TASK-B-013 review.* |
+| TASK-B-014 | P1 | **DONE** | Deletion and rename classified with the same precedence as opens (protected → persistence → disposable-runtime → review), using a **narrower** deletion-safe set than the write allowlist; `renameat2` also classifies ordinary outside destinations and both paths under `RENAME_EXCHANGE`. Compiler temp files are deliberately NOT exempted (documented). |
 | TASK-B-013 | P2 | **DONE** | Extend the runtime-noise set (`~/.claude/shell-snapshots/`, `~/.claude/file-history/`, agent `/tmp` scratch) after real sessions (`"read readme.md"`, 3,788 events) still graded REVIEW_NEEDED on 21 agent bookkeeping writes: `~/.claude/shell-snapshots/` (19) plus agent `/tmp` scratch (2). Adds those to the noise set while keeping `~/.claude/settings*.json` and `~/.claude.json` persistence-sensitive. |
 | TASK-B-012 | P1 | **DONE** | Effect-aware write policy (user-reported: a `"read README.md"` session still graded REVIEW_NEEDED on 35 agent/toolchain bookkeeping writes). Split outside writes into runtime-noise (informational) / ordinary (`REVIEW_NEEDED`) / persistence-activation (`persistence-sensitive-write`, UNSAFE); trusted monitored-home with fail-closed; fixed the protected-verdict leak (AWS creds, sudoers). |
 | TASK-B-011 | P1 | **DONE** | Operation-aware boundary policy redesign (user-reported false-positive storm: a README-only Claude session graded UNSAFE with 1,653 boundary alerts, ~98% read-only). Rename `project-boundary-access` → `outside-project-write`; outside-project **reads** become informational, only **writes/creates** are a boundary violation; verdict drops generic boundary from UNSAFE → REVIEW_NEEDED. C + Python parity, plus a non-sudo C rule harness (`make test-c`). |
@@ -55,6 +56,56 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-B-014 — Deletion/rename precedence; compiler noise accepted
+*Completed 2026-07-28.*
+
+**Problem (user-reported):** a session that wrote a hello-world C file, compiled
+and ran it graded REVIEW_NEEDED on 9 drivers — 7 GCC intermediates under `/tmp`
+(`ccXXXXXX.s|.o|.res|.cdtor.*`, written by `gcc`/`cc1`/`as`/`collect2`) and 2
+deletions (`docs/hello.c` and the compiled binary inside the agent's own,
+already write-exempt, `/tmp` scratch). The user asked whether REVIEW_NEEDED is
+defensible here.
+
+**Director verdict:** the verdict is right but the explanation is noisy — "eight
+of its nine drivers should not be presented as reasons for review".
+
+**Decisions taken:**
+- **Compiler temps stay reportable.** Exempting `/tmp/cc*` by filename shape, or
+  by shape plus `comm`, was rejected: `comm` is attacker-controllable, a real
+  `gcc`/`as`/`ld` writes wherever its caller says, and file events carry no
+  verified executable identity (`exe_path` exists only on `execve`). The sound
+  fix is a private per-session `TMPDIR` handed to the agent — impossible here
+  because SysGuard *observes* an independently launched agent rather than
+  starting it. The false positive is therefore accepted and documented: the
+  build genuinely did write outside the project.
+- **Deletion gets open-style precedence** — protected → `UNSAFE`, persistence /
+  activation → `UNSAFE` (a deleted `authorized_keys` or shell rc also changes
+  what runs next session), disposable runtime → informational, else review.
+- **The write allowlist is NOT reused wholesale for deletion** (director's
+  correction to my proposal): deleting `~/.claude/history.jsonl`, `backups/` or
+  `file-history/` is destructive and unlinking `/dev/null` is not bookkeeping.
+  Only the agent's own uid-scoped scratch, cwd markers, `.claude.json.tmp.*` and
+  recreatable caches/logs are deletion-exempt.
+- **In-project source deletion stays REVIEW_NEEDED**, and git trackedness must
+  not downgrade it: create → compile → delete leaves no git evidence at all,
+  which is exactly where syscall history beats `git diff`.
+- **`renameat2` gap closed**: ordinary outside destinations are now classified
+  too, so staging in an exempt location and renaming to `/tmp/payload` no longer
+  bypasses the boundary signal.
+
+**Verification:** clean zero-warning build; `make test-c` all passed; **131
+Python tests OK**. The reported session keeps `REVIEW_NEEDED` but its review
+drivers reduce to the `docs/hello.c` deletion plus the (documented) compiler
+temps; the scratch-binary deletion moved to the informational bucket.
+
+**Director review:** four passes, every finding applied — (1) `RENAME_EXCHANGE`
+swaps both paths, so both are destinations and both must be classified;
+(2) the C engine returns a single alert, so exchange targets must be scanned
+severity-major (protected across both, then persistence, then boundary) or an
+ordinary outside path could mask a critical one; (3) the new informational
+deletion bucket was not rendered, breaking the promise that exempted activity
+always stays visible in the report. Final pass: no regressions.
 
 ### TASK-B-013 — Runtime-noise set extended (shell snapshots, agent /tmp scratch)
 *Completed 2026-07-28.*

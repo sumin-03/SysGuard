@@ -55,8 +55,22 @@ RUNTIME_NOISE_ABS_EXACT = (
 # onto a protected/persistence target is caught by the rename rule.
 _TMP_AGENT_DIR_RE = re.compile(r"^/tmp/claude-([0-9]+)/")
 _TMP_AGENT_CWD_RE = re.compile(r"^/tmp/claude-[0-9a-f]{4,16}-cwd$")
+# renameat2 RENAME_EXCHANGE: the two paths are SWAPPED, so both are mutated.
+# (linux/fs.h; not exposed by Python's os module.)
+RENAME_EXCHANGE = 1 << 1
+
 # Atomic config staging file directly under home: .claude.json.tmp.<pid>.<hex>.
 _CLAUDE_JSON_TMP_RE = re.compile(r"^\.claude\.json\.tmp\.[0-9]+\.[0-9A-Fa-f]+$")
+
+# Deletion is NOT the same as writing. The write-noise set above must not be
+# reused wholesale for unlinkat: deleting ~/.claude/history.jsonl, backups/ or
+# file-history/ is destructive, and unlinking /dev/null or a kernel trace marker
+# is not routine bookkeeping at all. Only genuinely disposable locations belong
+# here — scratch, staging, caches and logs the agent recreates freely.
+RUNTIME_NOISE_DELETION_HOME_PREFIXES = (
+    ".npm/_cacache/", ".npm/_logs/",
+    ".cache/claude-cli-nodejs/", ".config/Code/logs/",
+)
 
 # Persistence / activation targets: a MUTATION here is UNSAFE (reads are fine —
 # shells read .bashrc constantly). Home-relative unless absolute.
@@ -252,6 +266,23 @@ def is_runtime_noise_write(path: str, home_path, uid=None) -> bool:
         return False
     if path in RUNTIME_NOISE_ABS_EXACT:
         return True
+    if is_agent_tmp_scratch(path, uid):
+        return True
+    rel = _home_rel(path, home_path)
+    if rel is None:
+        return False
+    if rel in RUNTIME_NOISE_HOME_EXACT:
+        return True
+    if "/" not in rel and _CLAUDE_JSON_TMP_RE.match(rel):
+        return True
+    return any(rel.startswith(pfx) for pfx in RUNTIME_NOISE_HOME_PREFIXES)
+
+
+def is_agent_tmp_scratch(path: str, uid=None) -> bool:
+    """True for the agent's OWN uid-scoped /tmp run directory or a cwd marker.
+    Shared by the write and deletion classifiers."""
+    if not path or _has_dot_segment(path):
+        return False
     m = _TMP_AGENT_DIR_RE.match(path)
     if m:
         # Only the writer's OWN uid-scoped directory, never an arbitrary number.
@@ -269,14 +300,27 @@ def is_runtime_noise_write(path: str, home_path, uid=None) -> bool:
         return not _tmp_path_is_redirected(path)
     if _TMP_AGENT_CWD_RE.match(path):
         return not _tmp_path_is_redirected(path)
+    return False
+
+
+def is_runtime_noise_deletion(path: str, home_path, uid=None) -> bool:
+    """True for the deletion of a genuinely disposable runtime artifact.
+
+    Deliberately a SMALLER set than `is_runtime_noise_write`: an agent recreates
+    its scratch files and caches freely, but deleting its history, backups or
+    file-history is destructive, and unlinking /dev/null or a kernel trace marker
+    is not bookkeeping at all. Callers must run the protected and persistence
+    checks first."""
+    if not path or _has_dot_segment(path):
+        return False
+    if is_agent_tmp_scratch(path, uid):
+        return True
     rel = _home_rel(path, home_path)
     if rel is None:
         return False
-    if rel in RUNTIME_NOISE_HOME_EXACT:
-        return True
     if "/" not in rel and _CLAUDE_JSON_TMP_RE.match(rel):
         return True
-    return any(rel.startswith(pfx) for pfx in RUNTIME_NOISE_HOME_PREFIXES)
+    return any(rel.startswith(p) for p in RUNTIME_NOISE_DELETION_HOME_PREFIXES)
 
 
 def is_persistence_sensitive(path: str, home_path) -> bool:
@@ -574,19 +618,47 @@ def classify_event(event: dict, home_path=None) -> dict:
     # exempt runtime directory could be renamed onto .env / ~/.aws/credentials /
     # ~/.claude.json and never be reported.
     if ev_type == "renameat2":
-        dest = event.get("new_path", "") or ""
-        if dest and is_protected_path(dest):
-            findings.append({
-                "type": "protected_path_access",
-                "severity": "high",
-                "detail": f"Protected path replaced by rename: {dest}",
-            })
-        elif dest and is_persistence_sensitive(dest, home_path):
-            findings.append({
-                "type": "persistence_sensitive_write",
-                "severity": "critical",
-                "detail": f"Rename onto persistence/activation target: {dest}",
-            })
+        # Normally only the destination is mutated, but RENAME_EXCHANGE swaps the
+        # two files, so BOTH paths are destinations — otherwise an exchange could
+        # mutate a protected/persistence/outside `old_path` while `new_path` sits
+        # harmlessly inside the project.
+        targets = [event.get("new_path", "") or ""]
+        try:
+            rflags = int(event.get("flags") or 0)
+        except (TypeError, ValueError):
+            rflags = 0
+        if rflags & RENAME_EXCHANGE:
+            src = event.get("old_path", "") or ""
+            if src and src not in targets:
+                targets.append(src)
+
+        for dest in targets:
+            if not dest:
+                continue
+            verb = "exchanged by rename" if (rflags & RENAME_EXCHANGE) else "replaced by rename"
+            if is_protected_path(dest):
+                findings.append({
+                    "type": "protected_path_access",
+                    "severity": "high",
+                    "detail": f"Protected path {verb}: {dest}",
+                })
+            elif is_persistence_sensitive(dest, home_path):
+                findings.append({
+                    "type": "persistence_sensitive_write",
+                    "severity": "critical",
+                    "detail": f"Rename onto persistence/activation target: {dest}",
+                })
+            elif (project_path and project_path != "."
+                    and not is_inside_project(dest, project_path)
+                    and not is_runtime_noise_write(dest, home_path, event.get("uid"))):
+                # Otherwise staging a file in an exempt runtime location and
+                # renaming it to an ordinary outside target (e.g. /tmp/payload)
+                # would bypass the outside-write signal entirely.
+                findings.append({
+                    "type": "boundary_violation",
+                    "severity": "high",
+                    "detail": f"Rename to a target outside the project: {dest}",
+                })
 
     if ev_type == "execve" and argv:
         if is_dangerous_command(argv):
@@ -597,13 +669,34 @@ def classify_event(event: dict, home_path=None) -> dict:
             })
 
     if ev_type == "unlinkat" and path:
-        # A deletion was requested. On its own this is a review signal, not an
-        # automatic UNSAFE — see evaluate_commit_safety.
-        findings.append({
-            "type": "file_deletion",
-            "severity": "medium",
-            "detail": f"File deletion requested: {path}",
-        })
+        # A deletion gets the same precedence as an open: protected, then
+        # persistence, then the (narrower) deletion-safe runtime set, then an
+        # ordinary review signal. Removing an activation target is a mutation of
+        # it — a deleted authorized_keys or shell rc changes what runs next time.
+        if is_protected_path(path):
+            findings.append({
+                "type": "protected_path_access",
+                "severity": "high",
+                "detail": f"Protected path deletion requested: {path}",
+            })
+        elif is_persistence_sensitive(path, home_path):
+            findings.append({
+                "type": "persistence_sensitive_write",
+                "severity": "critical",
+                "detail": f"Deletion of persistence/activation target: {path}",
+            })
+        elif is_runtime_noise_deletion(path, home_path, event.get("uid")):
+            findings.append({
+                "type": "runtime_noise_deletion",
+                "severity": "info",
+                "detail": f"Runtime scratch deletion: {path}",
+            })
+        else:
+            findings.append({
+                "type": "file_deletion",
+                "severity": "medium",
+                "detail": f"File deletion requested: {path}",
+            })
 
     if ev_type == "fchmodat":
         try:
@@ -645,6 +738,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     persistence_writes = []
     boundary_violations = []
     runtime_noise_writes = []
+    runtime_noise_deletions = []
     dangerous_commands = []
     file_deletions = []
     unsafe_permission_changes = []
@@ -662,6 +756,8 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
                 boundary_violations.append(f)
             elif f["type"] == "runtime_noise_write":
                 runtime_noise_writes.append(f)
+            elif f["type"] == "runtime_noise_deletion":
+                runtime_noise_deletions.append(f)
             elif f["type"] == "dangerous_command":
                 dangerous_commands.append(f)
             elif f["type"] == "file_deletion":
@@ -799,6 +895,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
         "persistence_writes": persistence_writes,
         "boundary_violations": boundary_violations,
         "runtime_noise_writes": runtime_noise_writes,
+        "runtime_noise_deletions": runtime_noise_deletions,
         "monitored_home": home_path,
         "outside_project_reads": outside_read_count,
         "outside_project_read_paths": outside_read_paths,

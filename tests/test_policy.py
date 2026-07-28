@@ -642,3 +642,110 @@ class B012EffectAwareWriteTests(unittest.TestCase):
                 if probe.is_symlink():
                     probe.unlink()
                 link.unlink(missing_ok=True)
+
+
+class B014DeletionPrecedenceTests(unittest.TestCase):
+    """TASK-B-014: deletions get the same precedence as opens, with a narrower
+    disposable set than the write allowlist (director's correction)."""
+
+    HOME = "/home/u"
+    UID = 4242
+
+    def _unlink(self, path, uid=None):
+        return make_event("unlinkat", path=path, project_path="/project",
+                          comm="rm", uid=self.UID if uid is None else uid)
+
+    def _verdict(self, events):
+        return policy.evaluate_commit_safety(events, "/project", home_path=self.HOME)
+
+    def test_own_scratch_deletion_is_informational(self):
+        r = self._verdict([self._unlink(
+            f"/tmp/claude-{self.UID}/-home-u-proj/uuid/scratchpad/hello")])
+        self.assertEqual(r["safety"], "SAFE")
+        self.assertEqual(len(r["runtime_noise_deletions"]), 1)
+        self.assertEqual(r["file_deletions"], [])
+
+    def test_other_uid_scratch_deletion_is_reviewable(self):
+        r = self._verdict([self._unlink(
+            "/tmp/claude-9999/-home-u-proj/uuid/scratchpad/hello")])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["file_deletions"]), 1)
+
+    def test_protected_and_persistence_deletions_are_unsafe(self):
+        r = self._verdict([self._unlink("/project/.env")])
+        self.assertEqual(r["safety"], "UNSAFE")
+        self.assertEqual(len(r["protected_accesses"]), 1)
+        self.assertEqual(r["file_deletions"], [])
+        for p in ["/home/u/.bashrc", "/home/u/.ssh/authorized_keys",
+                  "/etc/cron.d/x", "/home/u/.claude/settings.json"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._unlink(p)])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["persistence_writes"]), 1)
+
+    def test_write_allowlist_is_not_reused_wholesale_for_deletion(self):
+        # Deleting history/backups/file-history is destructive even though
+        # WRITING to them is routine bookkeeping.
+        for p in ["/home/u/.claude/history.jsonl", "/home/u/.claude/backups/b",
+                  "/home/u/.claude/file-history/uuid/h@v2",
+                  "/home/u/.claude/projects/s.jsonl", "/dev/null"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._unlink(p)])
+                self.assertEqual(r["safety"], "REVIEW_NEEDED")
+                self.assertEqual(len(r["file_deletions"]), 1)
+                self.assertEqual(r["runtime_noise_deletions"], [])
+        # Caches/logs the agent recreates freely are disposable.
+        r = self._verdict([self._unlink("/home/u/.npm/_logs/x.log")])
+        self.assertEqual(r["safety"], "SAFE")
+
+    def test_in_project_source_deletion_stays_reviewable(self):
+        # create -> delete inside the session leaves no git evidence; that is
+        # exactly the signal worth surfacing, regardless of git trackedness.
+        events = [
+            make_event("openat", path="/project/docs/hello.c",
+                       project_path="/project", comm="claude", uid=self.UID,
+                       flags=os.O_WRONLY | os.O_CREAT),
+            self._unlink("/project/docs/hello.c"),
+        ]
+        r = self._verdict(events)
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["file_deletions"]), 1)
+
+    def test_compiler_temps_are_not_exempt(self):
+        # Recognizing forgeable gcc temp filenames would be an attacker-
+        # controllable allowlist; the build noise is accepted instead.
+        r = self._verdict([make_event("openat", path="/tmp/ccQ3Au8q.s",
+                                      project_path="/project", comm="cc1",
+                                      uid=self.UID, flags=os.O_WRONLY | os.O_CREAT)])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["boundary_violations"]), 1)
+
+    def test_rename_to_ordinary_outside_target_is_a_boundary_write(self):
+        # Staging in an exempt location then renaming out must not bypass it.
+        ev = make_event("renameat2", path="", project_path="/project",
+                        comm="claude", uid=self.UID,
+                        old_path=f"/tmp/claude-{self.UID}/stage",
+                        new_path="/tmp/payload")
+        r = self._verdict([ev])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["boundary_violations"]), 1)
+
+    def test_rename_exchange_classifies_both_paths(self):
+        # RENAME_EXCHANGE swaps the files, so old_path is a destination too.
+        for src, expect_bucket in [("/home/u/.bashrc", "persistence_writes"),
+                                   ("/project/.env", "protected_accesses"),
+                                   ("/tmp/payload", "boundary_violations")]:
+            with self.subTest(src=src):
+                ev = make_event("renameat2", path="", project_path="/project",
+                                comm="claude", uid=self.UID, old_path=src,
+                                new_path="/project/benign.txt",
+                                flags=policy.RENAME_EXCHANGE)
+                r = self._verdict([ev])
+                self.assertEqual(len(r[expect_bucket]), 1)
+                self.assertNotEqual(r["safety"], "SAFE")
+
+    def test_plain_rename_only_classifies_the_destination(self):
+        ev = make_event("renameat2", path="", project_path="/project",
+                        comm="claude", uid=self.UID, old_path="/home/u/.bashrc",
+                        new_path="/project/benign.txt", flags=0)
+        self.assertEqual(self._verdict([ev])["safety"], "SAFE")

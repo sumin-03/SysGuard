@@ -429,7 +429,7 @@ class B012MutationSectionTests(unittest.TestCase):
             rendered = read_text(out)
 
         self.assertIn("Outside-Project Mutations", rendered)
-        self.assertIn("Runtime bookkeeping writes", rendered)
+        self.assertIn("Runtime bookkeeping", rendered)
         self.assertIn("did not target protected, persistence-sensitive", rendered)
         self.assertIn("Persistence-Sensitive Writes", rendered)
         self.assertIn(html.escape(persist_path), rendered)
@@ -444,3 +444,17 @@ class B012MutationSectionTests(unittest.TestCase):
             out = report.generate_report(path, project_path="/project")
             rendered = read_text(out)
         self.assertNotIn("Persistence-Sensitive Writes", rendered)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_runtime_scratch_deletions_are_rendered(self, _git):
+        uid = os.getuid()
+        scratch = f"/tmp/claude-{uid}/proj/uuid/scratchpad/hello"
+        with tempfile.TemporaryDirectory() as d:
+            path = write_jsonl(d, [make_event("unlinkat", path=scratch,
+                                              project_path="/project", comm="rm",
+                                              uid=uid)])
+            rendered = read_text(report.generate_report(path, project_path="/project"))
+        self.assertIn("Runtime bookkeeping", rendered)
+        self.assertIn("scratch deletion", rendered)
+        self.assertIn(html.escape(scratch), rendered)
+        self.assertNotIn("File Deletions", rendered)

@@ -75,6 +75,16 @@ static const char *runtime_noise_abs_exact[] = {
     "/sys/kernel/tracing/trace_marker",
 };
 
+/* Deletion is NOT the same as writing: the write-noise set must not be reused
+ * wholesale. Deleting ~/.claude/history.jsonl, backups/ or file-history/ is
+ * destructive, and unlinking /dev/null or a kernel trace marker is not routine
+ * bookkeeping. Only genuinely disposable locations. Mirrors
+ * RUNTIME_NOISE_DELETION_HOME_PREFIXES in app/policy.py. */
+static const char *runtime_noise_deletion_home_prefixes[] = {
+    ".npm/_cacache/", ".npm/_logs/",
+    ".cache/claude-cli-nodejs/", ".config/Code/logs/",
+};
+
 /* Persistence / activation targets: a MUTATION here is UNSAFE. Reads are
  * ordinary — shells read .bashrc on every invocation. */
 static const char *persist_home_exact[] = {
@@ -98,6 +108,12 @@ static const char *persist_abs_prefixes[] = {
     "/usr/lib/systemd/system/", "/lib/systemd/system/",
     "/etc/profile.d/", "/etc/zsh/", "/etc/ld.so.conf.d/",
 };
+
+/* renameat2 RENAME_EXCHANGE (linux/fs.h): the two paths are SWAPPED, so both
+ * are mutated. Defined locally so <linux/fs.h> is not required. */
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -281,6 +297,21 @@ static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ct
     if (!strchr(rel, '/') && is_claude_json_tmp(rel))
         return 1;
     return has_prefix_in(rel, runtime_noise_home_prefixes, ARRAY_LEN(runtime_noise_home_prefixes));
+}
+
+/* Deletion of a genuinely disposable runtime artifact -> informational.
+ * Narrower than path_is_runtime_noise by design; callers must run the protected
+ * and persistence checks first. */
+static int path_is_runtime_noise_deletion(const char *path,
+                                          const struct sysguard_rule_ctx *ctx,
+                                          uint32_t uid) {
+    if (path_has_dot_segment(path)) return 0;
+    if (is_tmp_agent_scratch(path, uid)) return 1;
+    const char *rel = home_relative(path, ctx);
+    if (!rel) return 0;
+    if (!strchr(rel, '/') && is_claude_json_tmp(rel)) return 1;
+    return has_prefix_in(rel, runtime_noise_deletion_home_prefixes,
+                         ARRAY_LEN(runtime_noise_deletion_home_prefixes));
 }
 
 /* Mutation of these is a persistence/activation risk -> critical. */
@@ -520,36 +551,97 @@ int rules_evaluate(const struct sysguard_event *ev,
 
     if (ev->type == SYSGUARD_EVENT_RENAME) {
         /* A rename is classified by its DESTINATION, with the same precedence as
-         * an open: protected first, then persistence. Otherwise a file staged in
-         * an exempt runtime directory could be renamed onto .env / credentials /
-         * ~/.claude.json and never be reported. */
-        enum sysguard_severity psev;
-        const char *prule = path_protected_rule(ev->new_path, &psev);
-        if (prule) {
-            char reason[256];
-            snprintf(reason, sizeof(reason),
-                     "Protected path replaced by rename: %s -> %s",
-                     ev->old_path, ev->new_path);
-            fill_alert(out, ev, prule, psev, reason,
-                       "Verify the replacement was intended. Rotate the affected credentials if exposure is possible.");
-            return 1;
+         * an open: protected first, then persistence, then an ordinary outside
+         * target. Otherwise a file staged in an exempt runtime directory could be
+         * renamed onto .env / credentials / ~/.claude.json, or out to
+         * /tmp/payload, and never be reported.
+         *
+         * RENAME_EXCHANGE swaps the two files, so under that flag BOTH paths are
+         * destinations and both must be classified. */
+        const char *targets[2];
+        int n_targets = 0;
+        if (ev->new_path[0]) targets[n_targets++] = ev->new_path;
+        if ((ev->flags & RENAME_EXCHANGE) && ev->old_path[0])
+            targets[n_targets++] = ev->old_path;
+
+        /* Severity-major ordering: this engine returns ONE alert, so a
+         * protected or persistence target must win no matter which side of the
+         * exchange it is on. Scanning target-by-target would let an ordinary
+         * outside new_path mask a critical old_path. */
+        for (int t = 0; t < n_targets; t++) {
+            enum sysguard_severity psev;
+            const char *prule = path_protected_rule(targets[t], &psev);
+            if (prule) {
+                char reason[256];
+                snprintf(reason, sizeof(reason),
+                         "Protected path %s by rename: %s <-> %s",
+                         (ev->flags & RENAME_EXCHANGE) ? "exchanged" : "replaced",
+                         ev->old_path, ev->new_path);
+                fill_alert(out, ev, prule, psev, reason,
+                           "Verify the replacement was intended. Rotate the affected credentials if exposure is possible.");
+                return 1;
+            }
         }
-        /* persistence-sensitive-write via atomic replace: renaming a staging file
-         * onto ~/.claude.json (or any persistence target) activates new content,
-         * so the exempt staging open must not let the replacement through. */
-        if (path_is_persistence_sensitive(ev->new_path, ctx)) {
-            char reason[256];
-            snprintf(reason, sizeof(reason),
-                     "Rename onto persistence/activation target: %s -> %s",
-                     ev->old_path, ev->new_path);
-            fill_alert(out, ev, "persistence-sensitive-write", SYSGUARD_SEV_CRITICAL,
-                       reason,
-                       "Verify this was intended and inspect the target for injected commands.");
-            return 1;
+        for (int t = 0; t < n_targets; t++) {
+            if (path_is_persistence_sensitive(targets[t], ctx)) {
+                char reason[256];
+                snprintf(reason, sizeof(reason),
+                         "Rename onto persistence/activation target: %s", targets[t]);
+                fill_alert(out, ev, "persistence-sensitive-write", SYSGUARD_SEV_CRITICAL,
+                           reason,
+                           "Verify this was intended and inspect the target for injected commands.");
+                return 1;
+            }
+        }
+        for (int t = 0; t < n_targets; t++) {
+            const char *dest = targets[t];
+            if (boundary_ctx_valid(ctx) && dest && dest[0] == '/' &&
+                !path_is_inside_project(dest, ctx->project_path) &&
+                !path_is_runtime_noise(dest, ctx, ev->uid)) {
+                char reason[256];
+                snprintf(reason, sizeof(reason),
+                         "Rename to a target outside project boundary: %s (project root %s)",
+                         dest, ctx->project_path);
+                fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_HIGH,
+                           reason, "Verify writes/creates outside the project directory were intended.");
+                return 1;
+            }
         }
     }
 
     if (ev->type == SYSGUARD_EVENT_UNLINK) {
+        /* A deletion gets the same precedence as an open: protected, then
+         * persistence, then the (narrower) deletion-safe runtime set, then the
+         * ordinary review signal. Removing an activation target mutates it — a
+         * deleted authorized_keys or shell rc changes what runs next time — so a
+         * protected-looking target must not become informational just because an
+         * outer directory is exempt. */
+        enum sysguard_severity dsev;
+        const char *drule = path_protected_rule(ev->path, &dsev);
+        if (drule) {
+            char reason[256];
+            snprintf(reason, sizeof(reason),
+                     "Protected path deletion requested: %s by %s (pid %u)",
+                     ev->path, ev->comm, ev->pid);
+            fill_alert(out, ev, drule, dsev, reason,
+                       "Verify the removal was authorized. Rotate the affected credentials if exposure is possible.");
+            return 1;
+        }
+        if (path_is_persistence_sensitive(ev->path, ctx)) {
+            char reason[256];
+            snprintf(reason, sizeof(reason),
+                     "Deletion of persistence/activation target: %s by %s (pid %u)",
+                     ev->path, ev->comm, ev->pid);
+            fill_alert(out, ev, "persistence-sensitive-write", SYSGUARD_SEV_CRITICAL,
+                       reason,
+                       "Verify this was intended; removing an activation target changes what runs next session.");
+            return 1;
+        }
+        /* Disposable runtime artifact (own scratch, staging, caches/logs) —
+         * informational, no real-time alert. */
+        if (path_is_runtime_noise_deletion(ev->path, ctx, ev->uid))
+            return 0;
+
         /* file-unlink: a deletion was requested (captured at syscall entry, so
          * this records the attempt, not a confirmed removal). */
         char reason[256];

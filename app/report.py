@@ -236,11 +236,17 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     else:
         h += '<p class="empty">No review-worthy writes outside the project.</p>\n'
 
-    noise = safety.get("runtime_noise_writes", [])
+    # Informational runtime bookkeeping: writes and deletions of disposable
+    # artifacts. Exempt activity is never hidden — it is always shown here with
+    # counts and representative paths, it just does not drive the verdict.
+    noise = (safety.get("runtime_noise_writes", [])
+             + safety.get("runtime_noise_deletions", []))
     if noise:
-        h += "<h3>Runtime bookkeeping writes &mdash; informational</h3>\n"
-        h += (f'<p class="empty">Observed {len(noise)} known runtime-bookkeeping '
-              'write(s); these did not target protected, persistence-sensitive, or '
+        n_del = len(safety.get("runtime_noise_deletions", []))
+        kinds = "write(s)" if not n_del else f"write(s) and {n_del} scratch deletion(s)"
+        h += "<h3>Runtime bookkeeping &mdash; informational</h3>\n"
+        h += (f'<p class="empty">Observed {len(noise) - n_del} known runtime-bookkeeping '
+              f'{kinds}; these did not target protected, persistence-sensitive, or '
               'ordinary user paths, so they do not affect the verdict.</p>\n')
         h += "<ul>\n"
         for f, n in aggregate_for_display(noise, lambda x: x["detail"])[:20]:
