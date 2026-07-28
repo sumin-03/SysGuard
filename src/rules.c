@@ -59,6 +59,7 @@ static void fill_alert(struct sysguard_alert *out, const struct sysguard_event *
  * by path alone, an accepted cache-poisoning / session-script tradeoff. */
 static const char *runtime_noise_home_prefixes[] = {
     ".claude/projects/", ".claude/sessions/", ".claude/backups/",
+    ".claude/file-history/",
     ".claude/session-env/", ".claude/plugins/cache/",
     ".npm/_cacache/", ".npm/_logs/",
     ".cache/claude-cli-nodejs/", ".config/Code/logs/",

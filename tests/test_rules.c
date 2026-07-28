@@ -128,6 +128,7 @@ int main(void)
     const char *noise[] = {
         HOME "/.claude/projects/s.jsonl", HOME "/.claude/sessions/1.json",
         HOME "/.claude/backups/b", HOME "/.claude/history.jsonl",
+        HOME "/.claude/file-history/uuid/6ccb9ea1740990e8@v2",
         HOME "/.claude/session-env/x/hook.sh", HOME "/.claude/plugins/cache/p",
         HOME "/.npm/_cacache/x", HOME "/.npm/_logs/x.log",
         HOME "/.cache/claude-cli-nodejs/x.jsonl", HOME "/.config/Code/logs/x/cli.log",

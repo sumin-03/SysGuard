@@ -32,6 +32,7 @@ PROTECTED_PATHS = [
 # readable. A hardened profile would require session-created roots + integrity.
 RUNTIME_NOISE_HOME_PREFIXES = (
     ".claude/projects/", ".claude/sessions/", ".claude/backups/",
+    ".claude/file-history/",
     ".claude/session-env/", ".claude/plugins/cache/",
     ".npm/_cacache/", ".npm/_logs/",
     ".cache/claude-cli-nodejs/", ".config/Code/logs/",

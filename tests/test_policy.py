@@ -390,6 +390,7 @@ class B012EffectAwareWriteTests(unittest.TestCase):
         for p in [
             "/home/u/.claude/projects/s.jsonl", "/home/u/.claude/sessions/1.json",
             "/home/u/.claude/backups/b", "/home/u/.claude/history.jsonl",
+            "/home/u/.claude/file-history/uuid/6ccb9ea1740990e8@v2",
             "/home/u/.claude/session-env/x/hook.sh", "/home/u/.claude/plugins/cache/p",
             "/home/u/.npm/_cacache/x", "/home/u/.npm/_logs/x.log",
             "/home/u/.cache/claude-cli-nodejs/x.jsonl",
