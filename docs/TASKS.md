@@ -96,7 +96,22 @@ mode 0755, foreign ownership, a relative path, a missing directory, `/`, a
 trailing-slash symlink, a symlinked parent component and a 317-byte path are all
 refused with warnings.
 
-**Director review:** five passes, every finding applied — (1) out-of-bounds
+**GUI wiring:** `app/main.py` gained a "Tool TMPDIR" field (default
+`/tmp/claude-<uid>/tool-tmp`) and `prepare_tool_tmp()`, which creates the root on
+the monitored user's behalf — the GUI may run under sudo, so `sysguard` would
+otherwise refuse a root-owned directory. After Start it shows the exact
+`TMPDIR=... claude` command, since SysGuard observes the agent rather than
+launching it. Preparation is deliberately hardened: creation is confined to the
+user's own `/tmp/claude-<uid>/` run root (a typo like `/etc` is refused, never
+chmod'ed), the chain is walked through **directory file descriptors with
+`O_NOFOLLOW`** and mutated only via `fchown`/`fchmod` so the monitored user
+cannot win a symlink race against the root GUI, every directory created is
+chowned so nested paths stay traversable, and trailing slashes / `.` / `..` are
+normalized or refused so the GUI never advertises a root the collector will
+reject.
+
+**Director review:** five passes on the engine, every finding applied —
+(1) out-of-bounds
 suffix read for paths shorter than 3 bytes; (2) `/` as a root stripped to `""`
 and matched every absolute path (Python); (3) a trailing slash made the kernel
 resolve a final symlink before `lstat`, defeating the symlink check; (4) `lstat`
@@ -104,7 +119,11 @@ only inspects the final component, so a symlinked **parent** still passed —
 fixed by requiring a fully canonical path; (5) an over-long root was silently
 truncated, widening the exemption to sibling paths. Final pass: no issues.
 Residual TOCTOU (the directory could be replaced after startup validation) is
-documented; the Python verdict layer re-resolves each candidate path.
+documented; the Python verdict layer re-resolves each candidate path. Four
+further passes covered the GUI helper: privileged mutation before validation,
+trailing-slash mismatch with the collector, symlink-following during creation,
+un-chowned intermediate directories, and a symlink race in the chown — all
+fixed, final pass clean.
 
 ### TASK-B-014 — Deletion/rename precedence; compiler noise accepted
 *Completed 2026-07-28.*
