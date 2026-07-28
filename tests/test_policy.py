@@ -749,3 +749,81 @@ class B014DeletionPrecedenceTests(unittest.TestCase):
                         comm="claude", uid=self.UID, old_path="/home/u/.bashrc",
                         new_path="/project/benign.txt", flags=0)
         self.assertEqual(self._verdict([ev])["safety"], "SAFE")
+
+
+class B015ToolTmpTests(unittest.TestCase):
+    """TASK-B-015: a trusted per-session toolchain temp root (--tool-tmp).
+
+    Compiler intermediates are classified by an exact root agreed in advance,
+    never by forgeable /tmp/cc* filenames.
+    """
+
+    HOME = "/home/u"
+    UID = 4242
+    ROOT = "/tmp/sg-tool-tmp"
+
+    def _open(self, path, flags=os.O_WRONLY | os.O_CREAT, **kw):
+        kw.setdefault("uid", self.UID)
+        return make_event("openat", path=path, project_path="/project",
+                          comm="cc1", flags=flags, **kw)
+
+    def _verdict(self, events, root=None):
+        return policy.evaluate_commit_safety(
+            events, "/project", home_path=self.HOME,
+            tool_tmp=self.ROOT if root is None else root)
+
+    def test_build_temps_inside_the_root_are_informational(self):
+        for p in [f"{self.ROOT}/ccWOZK5O.s", f"{self.ROOT}/sub/cc4hnobq.o"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p)])
+                self.assertEqual(r["safety"], "SAFE")
+                self.assertEqual(len(r["runtime_noise_writes"]), 1)
+
+    def test_same_filenames_outside_the_root_stay_reported(self):
+        # A forged /tmp/cc* name buys nothing — membership is by exact root.
+        r = self._verdict([self._open("/tmp/ccWOZK5O.s")])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["boundary_violations"]), 1)
+
+    def test_traversal_and_the_root_itself_are_not_members(self):
+        for p in [f"{self.ROOT}/../escape", self.ROOT, f"{self.ROOT}/"]:
+            with self.subTest(path=p):
+                self.assertFalse(policy.path_in_tool_tmp(p, self.ROOT))
+
+    def test_without_a_configured_root_the_exemption_is_off(self):
+        r = self._verdict([self._open(f"{self.ROOT}/ccWOZK5O.s")], root="")
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+
+    def test_protected_and_persistence_win_inside_the_root(self):
+        r = self._verdict([self._open(f"{self.ROOT}/.env")])
+        self.assertEqual(r["safety"], "UNSAFE")
+        r = self._verdict([self._open(f"{self.ROOT}/x", flags=os.O_RDONLY)])
+        self.assertEqual(r["safety"], "SAFE")
+
+    def test_deletion_inside_the_root_is_informational(self):
+        ev = make_event("unlinkat", path=f"{self.ROOT}/ccWOZK5O.s",
+                        project_path="/project", comm="gcc", uid=self.UID)
+        r = self._verdict([ev])
+        self.assertEqual(r["safety"], "SAFE")
+        self.assertEqual(len(r["runtime_noise_deletions"]), 1)
+
+    def test_recorded_tool_tmp_from_the_collector_is_used(self):
+        ev = self._open(f"{self.ROOT}/ccWOZK5O.s")
+        ev["tool_tmp"] = self.ROOT
+        r = policy.evaluate_commit_safety([ev], "/project", home_path=self.HOME)
+        self.assertEqual(r["tool_tmp"], self.ROOT)
+        self.assertEqual(r["safety"], "SAFE")
+        # An empty recorded value is authoritative: no trusted root.
+        ev2 = self._open(f"{self.ROOT}/ccWOZK5O.s")
+        ev2["tool_tmp"] = ""
+        r2 = policy.evaluate_commit_safety([ev2], "/project", home_path=self.HOME)
+        self.assertEqual(r2["safety"], "REVIEW_NEEDED")
+
+    def test_filesystem_root_is_never_a_valid_tool_tmp(self):
+        # "/" would strip to "" and match every absolute path, turning the
+        # exemption into blanket suppression.
+        for bad in ["/", "//", "///"]:
+            with self.subTest(root=bad):
+                self.assertFalse(policy.path_in_tool_tmp("/tmp/payload", bad))
+                r = self._verdict([self._open("/tmp/payload")], root=bad)
+                self.assertEqual(r["safety"], "REVIEW_NEEDED")

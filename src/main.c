@@ -4,6 +4,8 @@
 #include <signal.h>
 #include <time.h>
 #include <pwd.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <unistd.h>
 #include "collector.h"
 #include "target_filter.h"
@@ -28,7 +30,11 @@ static void usage(const char *prog) {
         "  --project-path <dir> Project root recorded for boundary analysis\n"
         "  --session-id <id>    Session identifier (defaults to the output stem)\n"
         "  --home-path <dir>    Monitored user's home (default: the invoking\n"
-        "                       non-root user's home, SUDO_USER-aware)\n",
+        "                       non-root user's home, SUDO_USER-aware)\n"
+        "  --tool-tmp <dir>     Trusted TMPDIR handed to the agent, so build\n"
+        "                       toolchain temp files are classified as runtime\n"
+        "                       noise. Must be absolute, owned by the monitored\n"
+        "                       user and mode 0700, or it is refused.\n",
         prog);
     exit(1);
 }
@@ -73,12 +79,85 @@ static void derive_session_id(char *dst, size_t dst_sz, const char *output) {
         *ext = '\0';
 }
 
+// Accept a --tool-tmp root only when it cannot be used as a hiding place by
+// anyone but the monitored user: absolute, no trailing '/', no "." / ".."
+// components, fully canonical (no symlink in ANY component), an existing real
+// directory, owned by the monitored uid, and mode 0700. Anything else is refused
+// with a warning, leaving toolchain temp files reportable.
+//
+// Residual risk (documented): validation happens once at startup, so the
+// monitored user could replace the directory afterwards (TOCTOU). The C engine
+// matches lexically and cannot re-check per event in the hot path; the Python
+// verdict layer independently resolves each candidate path and refuses the
+// exemption when it no longer resolves to itself. See README section 6.
+static int tool_tmp_is_trusted(const char *dir, uid_t owner) {
+    if (!dir || dir[0] != '/') {
+        fprintf(stderr, "[WARN] --tool-tmp must be an absolute path; ignoring.\n");
+        return 0;
+    }
+    // A trailing slash makes the kernel resolve a final symlink before lstat(),
+    // so "/tmp/link/" would report the TARGET and sail past the symlink check
+    // while the rules still match the lexical (symlinked) prefix. Refuse it.
+    size_t dlen = strlen(dir);
+    if (dlen > 1 && dir[dlen - 1] == '/') {
+        fprintf(stderr, "[WARN] --tool-tmp must not end with '/'; ignoring.\n");
+        return 0;
+    }
+    if (dlen < 2) {
+        fprintf(stderr, "[WARN] --tool-tmp must not be the filesystem root; ignoring.\n");
+        return 0;
+    }
+    if (strstr(dir, "/../") || strstr(dir, "/./") ||
+        (dlen >= 3 && strcmp(dir + dlen - 3, "/..") == 0) ||
+        (dlen >= 2 && strcmp(dir + dlen - 2, "/.") == 0)) {
+        fprintf(stderr, "[WARN] --tool-tmp must not contain '.' or '..'; ignoring.\n");
+        return 0;
+    }
+    struct stat st;
+    if (lstat(dir, &st) != 0) {
+        fprintf(stderr, "[WARN] --tool-tmp '%s' does not exist; ignoring.\n", dir);
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        fprintf(stderr, "[WARN] --tool-tmp '%s' is not a real directory; ignoring.\n", dir);
+        return 0;
+    }
+    // lstat() only inspects the FINAL component, so a symlinked parent
+    // ("/tmp/link/tool-tmp") would still pass. The rules match the lexical
+    // prefix, so such a root could redirect writes outside the trusted tree.
+    // Require the path to be fully canonical: realpath() resolves every
+    // component, and any difference means some component was a symlink.
+    char resolved[PATH_MAX];
+    if (!realpath(dir, resolved)) {
+        fprintf(stderr, "[WARN] --tool-tmp '%s' cannot be resolved; ignoring.\n", dir);
+        return 0;
+    }
+    if (strcmp(resolved, dir) != 0) {
+        fprintf(stderr,
+                "[WARN] --tool-tmp '%s' contains a symlinked component (resolves to '%s'); ignoring.\n",
+                dir, resolved);
+        return 0;
+    }
+    if (st.st_uid != owner) {
+        fprintf(stderr, "[WARN] --tool-tmp '%s' is not owned by uid %u; ignoring.\n",
+                dir, (unsigned)owner);
+        return 0;
+    }
+    if ((st.st_mode & 07777) != 0700) {
+        fprintf(stderr, "[WARN] --tool-tmp '%s' must be mode 0700 (is %04o); ignoring.\n",
+                dir, (unsigned)(st.st_mode & 07777));
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *output = NULL;
     const char *target_comm = NULL;
     const char *project_path = NULL;
     const char *session_id = NULL;
     const char *home_path = NULL;
+    const char *tool_tmp = NULL;
     unsigned long target_pid = 0;
     int fake = 0;
     int agent_mode = 0;
@@ -106,6 +185,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--home-path") == 0) {
             if (++i >= argc) usage(argv[0]);
             home_path = argv[i];
+        } else if (strcmp(argv[i], "--tool-tmp") == 0) {
+            if (++i >= argc) usage(argv[0]);
+            tool_tmp = argv[i];
         } else {
             usage(argv[0]);
         }
@@ -131,6 +213,26 @@ int main(int argc, char **argv) {
         snprintf(session.home_path, sizeof(session.home_path), "%s", home_path);
     else
         resolve_monitored_home(session.home_path, sizeof(session.home_path));
+    if (tool_tmp) {
+        // Trust is anchored to the home we just resolved: the temp root must
+        // belong to the same monitored user, never to root or a third party.
+        struct stat hst;
+        uid_t owner = (uid_t)-1;
+        if (session.home_path[0] && stat(session.home_path, &hst) == 0)
+            owner = hst.st_uid;
+        if (owner != (uid_t)-1 && owner != 0 && tool_tmp_is_trusted(tool_tmp, owner)) {
+            // Never store a TRUNCATED root: a shortened prefix would exempt
+            // sibling paths that were never validated (e.g. ".../tool-tmp" cut
+            // to ".../tool" would also cover ".../tooling/").
+            if (strlen(tool_tmp) >= sizeof(session.tool_tmp))
+                fprintf(stderr,
+                        "[WARN] --tool-tmp path is too long (max %zu bytes); ignoring.\n",
+                        sizeof(session.tool_tmp) - 1);
+            else
+                snprintf(session.tool_tmp, sizeof(session.tool_tmp), "%s", tool_tmp);
+        } else if (owner == (uid_t)-1 || owner == 0)
+            fprintf(stderr, "[WARN] --tool-tmp needs a trusted monitored home; ignoring.\n");
+    }
     session.agent_mode = agent_mode;
 
     signal(SIGINT, sig_handler);
@@ -145,14 +247,18 @@ int main(int argc, char **argv) {
     if (session.target_comm[0])  printf("  Target  : comm=%s\n", session.target_comm);
     if (target_pid)              printf("  Target  : pid=%lu\n", target_pid);
     if (session.project_path[0]) printf("  Project : %s\n", session.project_path);
-    if (session.home_path[0])    printf("  Home    : %s\n", session.home_path);
-    else                         printf("  Home    : (untrusted - home-relative rules disabled)\n");
+    if (session.home_path[0])
+        printf("  Home    : %s\n", session.home_path);
+    else
+        printf("  Home    : (untrusted - home-relative rules disabled)\n");
+    if (session.tool_tmp[0])
+        printf("  ToolTmp : %s\n", session.tool_tmp);
     if (agent_mode)              printf("  Agent   : on\n");
     printf("========================================\n\n");
 
     if (fake) {
         fake_collector_run(output, session.session_id, project_path, target_comm,
-                           session.home_path);
+                           session.home_path, session.tool_tmp);
     } else {
 #ifdef HAS_BPF_COLLECTOR
         // Scope live collection to the target's process subtree. With no target

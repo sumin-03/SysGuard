@@ -66,7 +66,8 @@ static void render_dest_addr(char *dst, size_t sz, const struct sysguard_event *
 
 void jsonl_write_event(FILE *fp, const struct sysguard_event *ev,
                         const char *session_id, const char *project_path,
-                        const char *target_comm, const char *home_path) {
+                        const char *target_comm, const char *home_path,
+                        const char *tool_tmp) {
     if (!fp || !ev) return;
     char c[64], ep[512], av[512], p[512], op[512], np[512], si[128], pp[512], tc[64];
     char da_raw[64], da[128];
@@ -81,6 +82,8 @@ void jsonl_write_event(FILE *fp, const struct sysguard_event *ev,
     esc(tc, sizeof(tc), target_comm);
     char hp[SYSGUARD_MAX_PATH * 2];
     esc(hp, sizeof(hp), home_path);
+    char tt[SYSGUARD_MAX_PATH * 2];
+    esc(tt, sizeof(tt), tool_tmp);
     render_dest_addr(da_raw, sizeof(da_raw), ev);
     esc(da, sizeof(da), da_raw);
 
@@ -93,21 +96,22 @@ void jsonl_write_event(FILE *fp, const struct sysguard_event *ev,
         "\"comm\":\"%s\",\"argv\":\"%s\",\"path\":\"%s\","
         "\"old_path\":\"%s\",\"new_path\":\"%s\",\"flags\":%d,\"mode\":%d,"
         "\"addr_family\":%d,\"dest_addr\":\"%s\",\"dest_port\":%u,"
-        "\"project_path\":\"%s\",\"target_comm\":\"%s\",\"home_path\":\"%s\"}\n",
+        "\"project_path\":\"%s\",\"target_comm\":\"%s\",\"home_path\":\"%s\",\"tool_tmp\":\"%s\"}\n",
         (unsigned long long)ev->timestamp_ns, si,
         event_str(ev->type), ev->pid, ev->ppid, ev->uid,
         c, ev->type == SYSGUARD_EVENT_EXEC ? av : "",
         ev->type == SYSGUARD_EVENT_OPEN ? p : (ev->type == SYSGUARD_EVENT_EXEC ? ep : p),
         op, np, ev->flags, ev->mode,
         ev->addr_family, da, (unsigned)ev->dest_port,
-        pp, tc, hp);
+        pp, tc, hp, tt);
     fflush(fp);
 }
 
 void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
                         const struct sysguard_alert *a,
                         const char *session_id, const char *project_path,
-                        const char *target_comm, const char *home_path) {
+                        const char *target_comm, const char *home_path,
+                        const char *tool_tmp) {
     if (!fp || !a) return;
     char c[64], ri[128], re[512], rc[512], ep[512], p[512], av[512], op[512], np[512];
     char si[128], pp[512], tc[64], da_raw[64], da[128];
@@ -120,6 +124,8 @@ void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
     esc(tc, sizeof(tc), target_comm);
     char hp[SYSGUARD_MAX_PATH * 2];
     esc(hp, sizeof(hp), home_path);
+    char tt[SYSGUARD_MAX_PATH * 2];
+    esc(tt, sizeof(tt), tool_tmp);
     ep[0] = p[0] = av[0] = op[0] = np[0] = '\0';
     render_dest_addr(da_raw, sizeof(da_raw), ev);
     esc(da, sizeof(da), da_raw);
@@ -139,7 +145,7 @@ void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
         "\"comm\":\"%s\",\"argv\":\"%s\",\"path\":\"%s\","
         "\"old_path\":\"%s\",\"new_path\":\"%s\",\"flags\":%d,\"mode\":%d,"
         "\"addr_family\":%d,\"dest_addr\":\"%s\",\"dest_port\":%u,"
-        "\"project_path\":\"%s\",\"target_comm\":\"%s\",\"home_path\":\"%s\","
+        "\"project_path\":\"%s\",\"target_comm\":\"%s\",\"home_path\":\"%s\",\"tool_tmp\":\"%s\","
         "\"alert\":true,\"rule_id\":\"%s\",\"severity\":\"%s\","
         "\"reason\":\"%s\",\"recommendation\":\"%s\"}\n",
         (unsigned long long)a->timestamp_ns, si,
@@ -149,7 +155,7 @@ void jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
         ev && ev->type == SYSGUARD_EVENT_EXEC ? ep : p,
         op, np, ev ? ev->flags : 0, ev ? ev->mode : 0,
         ev ? ev->addr_family : 0, da, (unsigned)(ev ? ev->dest_port : 0),
-        pp, tc, hp,
+        pp, tc, hp, tt,
         ri, sysguard_severity_string(a->severity), re, rc);
     fflush(fp);
 }

@@ -46,6 +46,8 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 | TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
 | TASK-A-014 | P2 | READY | Record collector-resolved (symlink-resolved) target paths at event time. Both engines match paths lexically today — C cannot `realpath` in the real-time hot path and Python runs after the session, so a symlink created and removed during the run can make an exempt-looking path (`/tmp/claude-<uid>/x`, `~/.claude/projects/x`, ...) resolve to a persistence target and be classified as runtime noise. Resolving in the collector is the sound fix; the Python `realpath` cross-check is only defence in depth. *Raised by the director during the TASK-B-013 review.* |
+| TASK-A-015 | P1 | READY | Attach `sys_enter_rename` and `sys_enter_renameat`. Only `renameat2` is traced today, but glibc `rename()` issues the `rename` syscall (82) — measured: a 5,143-event real session recorded **zero** rename events. The whole rename-destination policy (protected / persistence / outside, `RENAME_EXCHANGE`) is therefore dead code in production, and the atomic-replace bypass it was built to stop would go undetected. Blocks project-local agent-config detection. |
+| TASK-B-015 | P1 | **DONE** | Trusted per-session toolchain temp root (`--tool-tmp`): compiler intermediates are classified by an exact pre-agreed root handed to the agent as `TMPDIR`, never by forgeable `/tmp/cc*` filenames. |
 | TASK-B-014 | P1 | **DONE** | Deletion and rename classified with the same precedence as opens (protected → persistence → disposable-runtime → review), using a **narrower** deletion-safe set than the write allowlist; `renameat2` also classifies ordinary outside destinations and both paths under `RENAME_EXCHANGE`. Compiler temp files are deliberately NOT exempted (documented). |
 | TASK-B-013 | P2 | **DONE** | Extend the runtime-noise set (`~/.claude/shell-snapshots/`, `~/.claude/file-history/`, agent `/tmp` scratch) after real sessions (`"read readme.md"`, 3,788 events) still graded REVIEW_NEEDED on 21 agent bookkeeping writes: `~/.claude/shell-snapshots/` (19) plus agent `/tmp` scratch (2). Adds those to the noise set while keeping `~/.claude/settings*.json` and `~/.claude.json` persistence-sensitive. |
 | TASK-B-012 | P1 | **DONE** | Effect-aware write policy (user-reported: a `"read README.md"` session still graded REVIEW_NEEDED on 35 agent/toolchain bookkeeping writes). Split outside writes into runtime-noise (informational) / ordinary (`REVIEW_NEEDED`) / persistence-activation (`persistence-sensitive-write`, UNSAFE); trusted monitored-home with fail-closed; fixed the protected-verdict leak (AWS creds, sudoers). |
@@ -56,6 +58,53 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-B-015 — Trusted toolchain temp root (`--tool-tmp`)
+*Completed 2026-07-28.*
+
+**Problem (user-reported):** a session that wrote, compiled and ran a
+hello-world C file graded REVIEW_NEEDED with the **7 GCC intermediates as the
+sole driver** (`/tmp/ccXXXXXX.s|.o|.res|.cdtor.*`). Unlike the previous session
+there was no deletion to justify the verdict independently, so a completely
+benign build produced a report consisting entirely of compiler internals.
+
+**Approach (per the director's design):** do not recognize forgeable compiler
+filenames — `comm` is attacker-controllable, a real `gcc`/`as`/`ld` writes
+wherever its caller says, and file events carry no verified executable identity.
+Instead agree on the *location* in advance: the user hands the agent a private
+`TMPDIR` and tells SysGuard about it with `--tool-tmp`, and only paths **beneath
+that exact root** are runtime noise. `gcc -o /tmp/payload` stays reported.
+
+**Validation (fail-closed, all refusals warn and leave temps reportable):**
+absolute · not `/` · no trailing `/` · no `.`/`..` component · fully canonical
+(`realpath(dir) == dir`, so no symlink in ANY component) · a real directory ·
+owned by the monitored user · mode `0700` · fits the session buffer (never
+stored truncated). The root is recorded in the JSONL `tool_tmp` field so the
+report classifies exactly as the live engine did, and an empty recorded value is
+authoritative.
+
+**Files changed (10):** `src/rules.{c,h}` (`tool_tmp_path` in the rule ctx,
+`path_in_tool_tmp`, used by both the write and deletion classifiers),
+`src/main.c` (`--tool-tmp` + `tool_tmp_is_trusted`), `src/collector.h`,
+`src/jsonl_writer.{c,h}` (additive `tool_tmp` field), `src/bpf_collector.c`,
+`src/fake_collector.c`, `app/policy.py` (`path_in_tool_tmp`, threaded through
+`classify_event`/`evaluate_commit_safety`), `README.md`, tests.
+
+**Verification:** clean zero-warning build; `make test-c` all passed; **139
+Python tests OK**. Live CLI checks: a valid root is accepted and recorded, while
+mode 0755, foreign ownership, a relative path, a missing directory, `/`, a
+trailing-slash symlink, a symlinked parent component and a 317-byte path are all
+refused with warnings.
+
+**Director review:** five passes, every finding applied — (1) out-of-bounds
+suffix read for paths shorter than 3 bytes; (2) `/` as a root stripped to `""`
+and matched every absolute path (Python); (3) a trailing slash made the kernel
+resolve a final symlink before `lstat`, defeating the symlink check; (4) `lstat`
+only inspects the final component, so a symlinked **parent** still passed —
+fixed by requiring a fully canonical path; (5) an over-long root was silently
+truncated, widening the exemption to sibling paths. Final pass: no issues.
+Residual TOCTOU (the directory could be replaced after startup validation) is
+documented; the Python verdict layer re-resolves each candidate path.
 
 ### TASK-B-014 — Deletion/rename precedence; compiler noise accepted
 *Completed 2026-07-28.*

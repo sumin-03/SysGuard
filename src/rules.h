@@ -17,6 +17,12 @@ struct sysguard_rule_ctx {
                                 // "", "/" or a relative value disables ONLY the
                                 // home-relative matches (fail-closed: such
                                 // writes then stay outside-project-write).
+    const char *tool_tmp_path;  // Trusted per-session toolchain temp root (the
+                                // TMPDIR handed to the agent), so compiler
+                                // intermediates land in an already-classified
+                                // location instead of /tmp/ccXXXXXX.*. NULL/""
+                                // disables the exemption. main.c validates it:
+                                // absolute, owned by the monitored uid, 0700.
 };
 
 int rules_evaluate(const struct sysguard_event *ev,

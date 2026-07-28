@@ -35,12 +35,14 @@ static struct sysguard_event mk_open(const char *path, int flags)
 
 /* Monitored home used by the home-relative parity rows (mirrors test_policy.py). */
 #define HOME "/home/u"
+/* Trusted per-session toolchain temp root (--tool-tmp). */
+#define TOOLTMP "/tmp/sg-tool-tmp"
 
 /* Return the rule_id fired for an event under project root P, or NULL. */
 static const char *rule_of(struct sysguard_event *e, const char *project)
 {
     static struct sysguard_alert a;
-    struct sysguard_rule_ctx ctx = { project, HOME };
+    struct sysguard_rule_ctx ctx = { project, HOME, TOOLTMP };
     if (rules_evaluate(e, &ctx, &a))
         return a.rule_id;
     return NULL;
@@ -51,7 +53,7 @@ static const char *rule_of(struct sysguard_event *e, const char *project)
 static const char *rule_of_nohome(struct sysguard_event *e, const char *project)
 {
     static struct sysguard_alert a;
-    struct sysguard_rule_ctx ctx = { project, NULL };
+    struct sysguard_rule_ctx ctx = { project, NULL, NULL };
     if (rules_evaluate(e, &ctx, &a))
         return a.rule_id;
     return NULL;
@@ -250,6 +252,42 @@ int main(void)
     /* Absolute no-op sinks likewise stay exempt without a home. */
     e = mk_open("/dev/null", O_WRONLY);
     CHECK(rule_of_nohome(&e, P) == NULL);
+
+    /* ---- TASK-B-015: trusted toolchain temp root (--tool-tmp) ------------- */
+
+    /* Build intermediates inside the trusted root are informational... */
+    e = mk_open(TOOLTMP "/ccWOZK5O.s", O_WRONLY | O_CREAT);
+    CHECK(rule_of(&e, P) == NULL);
+    e = mk_open(TOOLTMP "/sub/cc4hnobq.o", O_WRONLY | O_CREAT);
+    CHECK(rule_of(&e, P) == NULL);
+    /* ...deleting them likewise (the compiler cleans up after itself). */
+    e = mk_unlink(TOOLTMP "/ccWOZK5O.s", 1000);
+    CHECK(rule_of(&e, P) == NULL);
+    /* ...but the same filenames OUTSIDE the root stay reported, so a forged
+     * /tmp/cc* name buys nothing. */
+    e = mk_open("/tmp/ccWOZK5O.s", O_WRONLY | O_CREAT);
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
+    /* Traversal out of the root is refused. */
+    e = mk_open(TOOLTMP "/../escape", O_WRONLY | O_CREAT);
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
+    /* The root itself is not a member (only paths beneath it). */
+    e = mk_open(TOOLTMP, O_WRONLY | O_CREAT);
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
+    /* Without a configured root the exemption is off (fail closed). */
+    e = mk_open(TOOLTMP "/ccWOZK5O.s", O_WRONLY | O_CREAT);
+    CHECK(is(rule_of_nohome(&e, P), "outside-project-write"));
+    /* "/" as a root must not make every absolute path a member. */
+    {
+        static struct sysguard_alert a;
+        struct sysguard_rule_ctx slash = { P, HOME, "/" };
+        struct sysguard_event ev2 = mk_open("/tmp/payload", O_WRONLY | O_CREAT);
+        CHECK(rules_evaluate(&ev2, &slash, &a) &&
+              strcmp(a.rule_id, "outside-project-write") == 0);
+    }
+
+    /* Protected/persistence precedence still wins inside the root. */
+    e = mk_open(TOOLTMP "/.env", O_WRONLY);
+    CHECK(is(rule_of(&e, P), "env-file-access"));
 
     /* ---- TASK-B-014: deletion precedence (mirrors tests/test_policy.py) ---- */
 

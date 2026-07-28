@@ -8,11 +8,13 @@
 FILE *jsonl_open(const char *path);
 void  jsonl_write_event(FILE *fp, const struct sysguard_event *ev,
                          const char *session_id, const char *project_path,
-                         const char *target_comm, const char *home_path);
+                         const char *target_comm, const char *home_path,
+                         const char *tool_tmp);
 void  jsonl_write_alert(FILE *fp, const struct sysguard_event *ev,
                          const struct sysguard_alert *alert,
                          const char *session_id, const char *project_path,
-                         const char *target_comm, const char *home_path);
+                         const char *target_comm, const char *home_path,
+                         const char *tool_tmp);
 void  jsonl_close(FILE *fp);
 
 #endif

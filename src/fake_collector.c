@@ -106,14 +106,15 @@ static struct connect_scenario connect_scenarios[] = {
 static void fake_emit(FILE *fp, const struct sysguard_event *ev,
                       const struct sysguard_rule_ctx *rctx,
                       const char *session_id, const char *project_path,
-                      const char *target_comm, const char *home_path) {
+                      const char *target_comm, const char *home_path,
+                      const char *tool_tmp) {
     struct sysguard_alert alert;
     if (rules_evaluate(ev, rctx, &alert)) {
         printf("  [%s] %s - %s\n",
                sysguard_severity_string(alert.severity), alert.rule_id, alert.reason);
-        jsonl_write_alert(fp, ev, &alert, session_id, project_path, target_comm, home_path);
+        jsonl_write_alert(fp, ev, &alert, session_id, project_path, target_comm, home_path, tool_tmp);
     } else {
-        jsonl_write_event(fp, ev, session_id, project_path, target_comm, home_path);
+        jsonl_write_event(fp, ev, session_id, project_path, target_comm, home_path, tool_tmp);
     }
     usleep(200000);
 }
@@ -122,7 +123,8 @@ void fake_collector_run(const char *output_path,
                         const char *session_id,
                         const char *project_path,
                         const char *target_comm,
-                        const char *home_path) {
+                        const char *home_path,
+                        const char *tool_tmp) {
     FILE *fp = jsonl_open(output_path);
     if (!fp) {
         fprintf(stderr, "[ERROR] Cannot open %s\n", output_path);
@@ -132,7 +134,7 @@ void fake_collector_run(const char *output_path,
     printf("[SysGuard] Fake collector started. Generating %zu events...\n",
            N_SCENARIOS + N_CONNECT);
     uint64_t base_ts = (uint64_t)time(NULL) * 1000000000ULL;
-    struct sysguard_rule_ctx rctx = { project_path, home_path };
+    struct sysguard_rule_ctx rctx = { project_path, home_path, tool_tmp };
 
     for (size_t i = 0; i < N_SCENARIOS; i++) {
         struct sysguard_event ev = {0};
@@ -181,7 +183,7 @@ void fake_collector_run(const char *output_path,
             break;
         }
 
-        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path);
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path, tool_tmp);
     }
 
     /* CONNECT events (separate table; payload is a network destination). */
@@ -197,7 +199,7 @@ void fake_collector_run(const char *output_path,
         if (connect_scenarios[i].dest_ip && connect_scenarios[i].dest_ip[0])
             inet_pton(ev.addr_family, connect_scenarios[i].dest_ip, ev.dest_addr);
         ev.dest_port = connect_scenarios[i].dest_port;
-        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path);
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path, tool_tmp);
     }
 
     jsonl_close(fp);

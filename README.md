@@ -106,8 +106,6 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 | `persistence-sensitive-write` | mutation-capable `openat` / `renameat2` | critical | shell 시작 파일, `authorized_keys`, cron, systemd unit, autostart, git hook, 활성 agent config 등 **나중에 코드를 실행·활성화**시키는 대상에 대한 쓰기 |
 | `aws-credentials-access` | `renameat2` destination | critical | `~/.aws/credentials`를 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
 | `secrets-file-access` | `renameat2` destination | high | `config/secrets.json`을 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
-
-> `renameat2`는 **목적지(destination)** 기준으로 open과 동일한 우선순위(protected → persistence)를 적용한다. 면제된 runtime 디렉터리에 staging 파일을 만든 뒤 `.env`나 credentials로 rename하는 우회를 막기 위함이며, 이 두 rule은 그 parity를 위해 C 엔진에 추가되었다(Python은 이미 `PROTECTED_PATHS`로 처리 중).
 | `env-file-access` | `openat` | high | `.env` 계열 파일 접근 |
 | `ssh-key-access` | `openat` | critical | SSH key/config 접근 |
 | `shadow-access` | `openat` | critical | `/etc/shadow` 접근 |
@@ -120,6 +118,8 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 | `file-unlink` | `unlinkat` | medium | 실제 파일 삭제 발생 |
 | `outbound-connect` | `connect` | medium | 외부 network 연결 시도 |
 | `possible-secret-exfiltration` | sequence | critical | `.env` 접근 후 외부 전송 도구 실행 |
+
+> `renameat2`는 **목적지(destination)** 기준으로 open과 동일한 우선순위(protected → persistence → 일반 outside)를 적용하며, `RENAME_EXCHANGE`는 두 경로를 맞바꾸므로 **양쪽 모두** 목적지로 분류한다. 면제된 runtime 디렉터리에 staging 파일을 만든 뒤 `.env`·credentials·`/tmp/payload`로 rename하는 우회를 막기 위함이고, `aws-credentials-access`/`secrets-file-access`는 그 parity를 위해 C 엔진에 추가되었다(Python은 이미 `PROTECTED_PATHS`로 처리 중).
 
 > **위험도는 "위치"가 아니라 "효과(effect)"로 판정한다.** AI agent와 그 도구체인(node, npm, git, …)은 자기 런타임·설정·캐시·인증서·node_modules 등 project 밖 파일을 **정상적으로 읽고**, 세션 상태·캐시·로그를 **정상적으로 쓴다**. 따라서 "project 밖"이라는 위치만으로는 위험 신호가 되지 못한다. SysGuard는 다음 순서로 분류한다.
 >
@@ -178,7 +178,27 @@ system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·�
 
 **심볼릭 링크 — 미해결 한계(정직하게 명시).** 두 엔진 모두 경로를 **lexical**하게 매칭한다. C 엔진은 실시간 hot path라 매 이벤트를 `realpath`할 수 없고, Python은 세션이 끝난 뒤 실행되므로 **이벤트 시점의 링크 상태를 증명할 수 없다.** 따라서 면제 대상처럼 보이는 경로(`/tmp/claude-<uid>/x`든 `~/.claude/projects/x`든)를 민감한 대상으로 링크해두고 쓴 뒤 링크를 지우면, 리포트는 이를 런타임 노이즈로 분류할 수 있다. Python 쪽에 `realpath` 대조를 넣어 **실행 중 남아 있는 링크는 면제를 거부**하지만 이는 defence-in-depth일 뿐 보장이 아니다. 근본 해결은 collector가 **이벤트 시점에 resolve된 대상 경로를 기록**하는 것이며 `TASK-A-014`로 등록했다.
 
-**빌드 toolchain 임시 파일은 의도적으로 면제하지 않는다.** `gcc`는 컴파일 중 `/tmp/ccXXXXXX.s|.o|.res|.cdtor.*` 중간 산출물을 만들므로 C 프로젝트를 빌드한 세션은 `outside-project-write`가 뜬다. 이를 **파일명 패턴이나 `comm`으로 면제하지 않는 이유**: `comm`은 위조 가능하고, 진짜 `gcc`/`as`/`ld`도 호출자가 지정한 경로에 쓸 수 있으며, 파일 이벤트에는 검증된 실행 파일 신원이 없다(`exe_path`는 `execve`에만 존재). 즉 `/tmp/ccevil.o` 같은 payload와 진짜 컴파일러 임시 파일을 정적 규칙으로 구분할 수 없다. 근본 해결은 세션마다 예측 불가능한 `0700` 임시 루트를 만들어 `TMPDIR`로 넘기고 **그 루트만** 면제하는 것인데, SysGuard는 agent를 실행하지 않고 관찰만 하므로 현재 구조에서는 `TMPDIR`을 통제할 수 없다. 따라서 **오탐을 감수하고 사실대로 보고**한다 — 빌드가 project 밖에 쓴 것은 사실이기 때문이다.
+**빌드 toolchain 임시 파일 — 이름이 아니라 위치로 분류한다.** `gcc`는 컴파일 중 `/tmp/ccXXXXXX.s|.o|.res|.cdtor.*` 중간 산출물을 만든다. 이를 **파일명 패턴이나 `comm`으로 면제하지 않는다**: `comm`은 위조 가능하고, 진짜 `gcc`/`as`/`ld`도 호출자가 지정한 경로에 쓰며, 파일 이벤트에는 검증된 실행 파일 신원이 없다(`exe_path`는 `execve`에만 존재). 즉 `/tmp/ccevil.o` 같은 payload와 진짜 컴파일러 임시 파일을 정적 규칙으로 구분할 수 없다.
+
+대신 **신뢰 가능한 세션 임시 루트**를 미리 합의한다. 사용자가 agent에 `TMPDIR`로 넘긴 디렉터리를 `--tool-tmp`로 알려주면, SysGuard는 그 **정확한 루트 아래**의 쓰기·삭제만 런타임 노이즈로 분류한다. 이름이 아니라 사전 합의된 위치를 믿으므로 위조가 불가능하고, `gcc -o /tmp/payload`처럼 루트 밖으로 쓰는 것은 그대로 검토 대상이다.
+
+```bash
+# 1) agent에게 넘길 임시 루트 (본인 소유, 0700)
+mkdir -m 700 -p "/tmp/claude-$(id -u)/tool-tmp"
+
+# 2) 그 TMPDIR로 agent 실행
+TMPDIR="/tmp/claude-$(id -u)/tool-tmp" claude
+
+# 3) 같은 경로를 SysGuard에 알려줌
+sudo ./build/sysguard --agent-mode --target-comm claude \
+  --project-path "$(pwd)" \
+  --tool-tmp "/tmp/claude-$(id -u)/tool-tmp" \
+  --output logs/session.jsonl
+```
+
+루트는 **절대경로 · 후행 `/` 없음 · `.`/`..` 없음 · 모든 경로 구성요소가 심볼릭 링크가 아님(완전 정규 경로) · 실제 디렉터리(심볼릭 링크 아님) · 모니터링 대상 사용자 소유 · 모드 `0700`** 을 모두 만족해야 하며, 하나라도 어긋나면 경고와 함께 **거부**되어 임시 파일이 다시 검토 대상이 된다(fail-closed). 루트는 JSONL의 `tool_tmp` 필드에 기록되어 리포트가 실시간 엔진과 동일하게 분류한다. `--tool-tmp` 없이 실행하면 빌드 세션은 `outside-project-write`로 보고된다 — 빌드가 project 밖에 쓴 것은 사실이기 때문이다.
+
+> **잔여 위험(문서화).** 검증은 시작 시 1회 수행하므로, 모니터링 대상 사용자가 이후 디렉터리를 바꿔치기하는 TOCTOU 창이 남는다. C 엔진은 실시간 hot path라 매 이벤트를 재확인할 수 없지만, 판정을 소유한 Python 계층은 후보 경로를 매번 resolve해서 자기 자신으로 풀리지 않으면 면제를 거부한다. 근본 해결은 `TASK-A-014`(collector가 이벤트 시점 resolve된 경로 기록)와 같다.
 
 **알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`·`~/.claude/shell-snapshots/`(둘 다 이후 셸에서 source되는 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
 

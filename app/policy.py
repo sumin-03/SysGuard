@@ -233,6 +233,28 @@ def _home_rel(path: str, home_path):
     return None
 
 
+def path_in_tool_tmp(path: str, tool_tmp) -> bool:
+    """True when `path` lies under the trusted per-session toolchain temp root
+    (the TMPDIR handed to the agent via --tool-tmp).
+
+    Unlike matching "/tmp/cc*" filenames, this is an exact root agreed in advance
+    and validated by the collector (absolute, owned by the monitored user, mode
+    0700), so membership cannot be forged by choosing a filename. A build that
+    writes outside it (`gcc -o /tmp/payload`) is still reported."""
+    if not path or not tool_tmp or not tool_tmp.startswith("/"):
+        return False
+    if _has_dot_segment(path) or _has_dot_segment(tool_tmp):
+        return False
+    root = tool_tmp.rstrip("/")
+    # "/" (or "//") strips to "" and would then match every absolute path,
+    # turning the exemption into a blanket suppression. Never a valid root.
+    if not root:
+        return False
+    if not path.startswith(root + "/") or path == root + "/":
+        return False
+    return not _tmp_path_is_redirected(path)
+
+
 def _tmp_path_is_redirected(path: str) -> bool:
     """Best-effort check that an agent-scratch path under /tmp still resolves to
     itself; True when a symlink component currently points somewhere else.
@@ -250,7 +272,7 @@ def _tmp_path_is_redirected(path: str) -> bool:
         return True    # cannot verify -> fail closed
 
 
-def is_runtime_noise_write(path: str, home_path, uid=None) -> bool:
+def is_runtime_noise_write(path: str, home_path, uid=None, tool_tmp=None) -> bool:
     """True for a narrowly recognized agent/toolchain bookkeeping write that is
     informational, not a violation. Never a broad substring match.
 
@@ -265,6 +287,8 @@ def is_runtime_noise_write(path: str, home_path, uid=None) -> bool:
     if _has_dot_segment(path):
         return False
     if path in RUNTIME_NOISE_ABS_EXACT:
+        return True
+    if path_in_tool_tmp(path, tool_tmp):
         return True
     if is_agent_tmp_scratch(path, uid):
         return True
@@ -303,7 +327,7 @@ def is_agent_tmp_scratch(path: str, uid=None) -> bool:
     return False
 
 
-def is_runtime_noise_deletion(path: str, home_path, uid=None) -> bool:
+def is_runtime_noise_deletion(path: str, home_path, uid=None, tool_tmp=None) -> bool:
     """True for the deletion of a genuinely disposable runtime artifact.
 
     Deliberately a SMALLER set than `is_runtime_noise_write`: an agent recreates
@@ -313,6 +337,8 @@ def is_runtime_noise_deletion(path: str, home_path, uid=None) -> bool:
     checks first."""
     if not path or _has_dot_segment(path):
         return False
+    if path_in_tool_tmp(path, tool_tmp):
+        return True
     if is_agent_tmp_scratch(path, uid):
         return True
     rel = _home_rel(path, home_path)
@@ -566,7 +592,7 @@ def detect_review_signals(git_summary) -> list:
     return findings
 
 
-def classify_event(event: dict, home_path=None) -> dict:
+def classify_event(event: dict, home_path=None, tool_tmp=None) -> dict:
     """Classify a single JSONL event and return findings.
 
     Events are captured at syscall *entry*, so mutation events (unlinkat,
@@ -600,7 +626,7 @@ def classify_event(event: dict, home_path=None) -> dict:
                 "detail": f"Write to persistence/activation target: {path}",
             })
         elif is_boundary_violation(path, project_path, event.get("flags")):
-            if is_runtime_noise_write(path, home_path, event.get("uid")):
+            if is_runtime_noise_write(path, home_path, event.get("uid"), tool_tmp):
                 findings.append({
                     "type": "runtime_noise_write",
                     "severity": "info",
@@ -650,7 +676,7 @@ def classify_event(event: dict, home_path=None) -> dict:
                 })
             elif (project_path and project_path != "."
                     and not is_inside_project(dest, project_path)
-                    and not is_runtime_noise_write(dest, home_path, event.get("uid"))):
+                    and not is_runtime_noise_write(dest, home_path, event.get("uid"), tool_tmp)):
                 # Otherwise staging a file in an exempt runtime location and
                 # renaming it to an ordinary outside target (e.g. /tmp/payload)
                 # would bypass the outside-write signal entirely.
@@ -685,7 +711,7 @@ def classify_event(event: dict, home_path=None) -> dict:
                 "severity": "critical",
                 "detail": f"Deletion of persistence/activation target: {path}",
             })
-        elif is_runtime_noise_deletion(path, home_path, event.get("uid")):
+        elif is_runtime_noise_deletion(path, home_path, event.get("uid"), tool_tmp):
             findings.append({
                 "type": "runtime_noise_deletion",
                 "severity": "info",
@@ -717,7 +743,7 @@ def classify_event(event: dict, home_path=None) -> dict:
 
 
 def evaluate_commit_safety(events: list, project_path: str = "", git_summary=None,
-                           home_path=None) -> dict:
+                           home_path=None, tool_tmp=None) -> dict:
     """Evaluate all events and return commit safety result.
 
     `git_summary` (optional, the dict from git_summary.get_git_summary) supplies
@@ -732,6 +758,14 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     """
     if home_path is None:
         home_path = resolve_monitored_home(events)
+    if tool_tmp is None:
+        # Recorded by the collector so the report classifies exactly as the live
+        # engine did; an empty recorded value means "no trusted root" (fail closed).
+        for _ev in events:
+            if "tool_tmp" in _ev:
+                _t = _ev.get("tool_tmp")
+                tool_tmp = _t if isinstance(_t, str) and _t.startswith("/") else ""
+                break
 
     all_findings = []
     protected_accesses = []
@@ -745,7 +779,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     normal_activities = []
 
     for ev in events:
-        result = classify_event(ev, home_path)
+        result = classify_event(ev, home_path, tool_tmp)
         for f in result["findings"]:
             all_findings.append(f)
             if f["type"] == "protected_path_access":
@@ -897,6 +931,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
         "runtime_noise_writes": runtime_noise_writes,
         "runtime_noise_deletions": runtime_noise_deletions,
         "monitored_home": home_path,
+        "tool_tmp": tool_tmp or "",
         "outside_project_reads": outside_read_count,
         "outside_project_read_paths": outside_read_paths,
         "outside_project_unknown_opens": outside_unknown_count,

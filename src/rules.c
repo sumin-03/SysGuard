@@ -280,6 +280,23 @@ static const char *path_protected_rule(const char *path, enum sysguard_severity 
     return NULL;
 }
 
+/* Trusted per-session toolchain temp root (--tool-tmp), i.e. the TMPDIR handed
+ * to the monitored agent. Unlike /tmp/cc* filename matching, this is an exact
+ * root agreed in advance and validated by main.c (absolute, owned by the
+ * monitored uid, mode 0700), so an attacker cannot forge membership by choosing
+ * a filename. `gcc -o /tmp/payload` still lands outside it and stays reported. */
+static int path_in_tool_tmp(const char *path, const struct sysguard_rule_ctx *ctx) {
+    if (!ctx || !ctx->tool_tmp_path || ctx->tool_tmp_path[0] != '/') return 0;
+    if (!path || path[0] != '/') return 0;
+    if (path_has_dot_segment(path)) return 0;
+    size_t rlen = strlen(ctx->tool_tmp_path);
+    while (rlen > 1 && ctx->tool_tmp_path[rlen - 1] == '/') rlen--;
+    /* "/" would make every absolute path a member — never a valid root. */
+    if (rlen < 2) return 0;
+    if (strncmp(path, ctx->tool_tmp_path, rlen) != 0) return 0;
+    return path[rlen] == '/' && path[rlen + 1] != '\0';
+}
+
 /* Narrowly recognized agent/toolchain bookkeeping write -> informational. */
 static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ctx *ctx,
                                  uint32_t uid) {
@@ -287,6 +304,8 @@ static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ct
      * matching, so fail closed and let it be reported. */
     if (path_has_dot_segment(path)) return 0;
     if (str_in(path, runtime_noise_abs_exact, ARRAY_LEN(runtime_noise_abs_exact)))
+        return 1;
+    if (path_in_tool_tmp(path, ctx))
         return 1;
     if (is_tmp_agent_scratch(path, uid))
         return 1;
@@ -306,6 +325,7 @@ static int path_is_runtime_noise_deletion(const char *path,
                                           const struct sysguard_rule_ctx *ctx,
                                           uint32_t uid) {
     if (path_has_dot_segment(path)) return 0;
+    if (path_in_tool_tmp(path, ctx)) return 1;
     if (is_tmp_agent_scratch(path, uid)) return 1;
     const char *rel = home_relative(path, ctx);
     if (!rel) return 0;
