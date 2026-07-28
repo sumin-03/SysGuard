@@ -7,11 +7,11 @@
 // Session-scoped context for rule evaluation. Kept as a struct (rather than a
 // bare parameter) so future session context can be added without changing call
 // sites. ctx may be NULL, and project_path may be NULL/empty/non-absolute — in
-// that case only the project-boundary rule is disabled; all other rules still
-// evaluate normally.
+// that case only the outside-project-write rule is disabled; all other rules
+// still evaluate normally.
 struct sysguard_rule_ctx {
     const char *project_path;   // Absolute repo root, or NULL/"" to disable the
-                                // project-boundary-access rule.
+                                // outside-project-write rule.
 };
 
 int rules_evaluate(const struct sysguard_event *ev,

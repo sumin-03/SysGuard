@@ -222,16 +222,32 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         h += "<p>No normal activity recorded.</p>\n"
     h += "</div>\n"
 
-    # 4. Boundary Violations — always rendered so the README section-9 layout is
-    # stable regardless of session content.
-    h += '<div class="section"><h2>&#128683; Boundary Violations</h2>\n'
+    # 4. Outside-Project Writes — write/create opens outside the project root.
+    # Read-only outside-project access is routine agent/runtime behaviour and is
+    # summarized informationally below, not treated as a violation.
+    h += '<div class="section"><h2>&#128683; Outside-Project Writes</h2>\n'
     if safety["boundary_violations"]:
         h += "<ul>\n"
-        for f in safety["boundary_violations"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+        for f, n in aggregate_for_display(safety["boundary_violations"], lambda x: x["detail"]):
+            h += f'  <li>{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n"
     else:
-        h += '<p class="empty">No boundary violations.</p>\n'
+        h += '<p class="empty">No writes outside the project.</p>\n'
+    reads = safety.get("outside_project_reads", 0)
+    unknown = safety.get("outside_project_unknown_opens", 0)
+    read_paths = safety.get("outside_project_read_paths", [])
+    if reads or unknown:
+        note = (f'Non-sensitive outside-project reads: {reads} event(s)'
+                f'{", " + str(len(read_paths)) + " unique path(s) sampled below" if read_paths else ""}'
+                ' — routine runtime access, not treated as violations.')
+        if unknown:
+            note += f' Unknown-operation opens (legacy records): {unknown}.'
+        h += f'<p class="empty">{html.escape(note)}</p>\n'
+        if read_paths:
+            h += "<ul>\n"
+            for p in read_paths[:20]:
+                h += f'  <li class="empty">{html.escape(p)}</li>\n'
+            h += "</ul>\n"
     h += "</div>\n"
 
     # 5. Protected Path Access — always rendered.

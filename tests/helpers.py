@@ -13,6 +13,7 @@ def make_event(event_type, **overrides):
         "path": "",
         "project_path": "/project",
         "argv": "",
+        "flags": 0,        # openat default: O_RDONLY (read). Override for writes.
         "alert": False,
     }
     event.update(overrides)

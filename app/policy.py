@@ -108,12 +108,54 @@ def is_inside_project(path: str, project_path: str) -> bool:
         return path.startswith(project_path)
 
 
-def is_boundary_violation(path: str, project_path: str) -> bool:
+# Open flags that make an openat *mutating* (write/create/truncate/append) vs a
+# routine read. openat's `flags` field is captured in the event.
+_MUTATE_FLAG_BITS = os.O_CREAT | os.O_TRUNC | os.O_APPEND
+# O_TMPFILE is a compound flag: on Linux it is (__O_TMPFILE | O_DIRECTORY), so it
+# must be matched by whole-pattern equality, NOT OR-folded into the mask above —
+# otherwise a routine read-only directory scan (O_RDONLY | O_DIRECTORY) would set
+# the O_DIRECTORY bit and be misread as a mutation. Mirrors src/rules.c.
+_O_TMPFILE = getattr(os, "O_TMPFILE", 0)
+
+
+def open_flags_may_mutate(flags):
+    """True if an openat with these flags can change filesystem state, False if
+    it is a pure read, or None when the operation is unknown (flags absent or
+    not an int — legacy records). Note O_RDONLY|O_CREAT still *creates*, so the
+    create/trunc/append bits are checked, not only the access mode."""
+    if flags is None:
+        return None
+    try:
+        f = int(flags)
+    except (TypeError, ValueError):
+        return None
+    if (f & os.O_ACCMODE) in (os.O_WRONLY, os.O_RDWR):
+        return True
+    if f & _MUTATE_FLAG_BITS:
+        return True
+    return bool(_O_TMPFILE) and (f & _O_TMPFILE) == _O_TMPFILE
+
+
+def is_boundary_violation(path: str, project_path: str, flags=None) -> bool:
+    """True for an open OUTSIDE the project that can MUTATE the filesystem
+    (write/create/truncate/append).
+
+    Read-only outside-project access is routine agent/runtime behaviour (its own
+    install, config, caches, TLS certs, node_modules, ...) and is NOT a
+    violation. Sensitive paths are handled separately by the protected-path
+    rules, which the caller evaluates first. Missing/unknown flags -> not a
+    violation here (surfaced as an informational unknown-operation count by
+    evaluate_commit_safety).
+
+    The system-path allowlist is deliberately NOT applied here: writing to /usr,
+    /etc, /opt, /run, ... is a persistence/tampering signal, so the allowlist
+    (in evaluate_commit_safety) only suppresses informational reads, never
+    mutations."""
     if not path or not project_path or project_path == ".":
         return False
-    if is_system_path(path):
+    if is_inside_project(path, project_path):
         return False
-    return not is_inside_project(path, project_path)
+    return open_flags_may_mutate(flags) is True
 
 
 def is_env_file_path(path: str) -> bool:
@@ -278,17 +320,21 @@ def classify_event(event: dict) -> dict:
     ev_type = event.get("event", "")
 
     if ev_type == "openat" and path:
+        # Protected/sensitive paths are violations regardless of read/write and
+        # take precedence over the boundary rule (no double finding). A
+        # non-sensitive open outside the project is a violation ONLY when it can
+        # mutate the filesystem — routine read-only runtime access is not.
         if is_protected_path(path):
             findings.append({
                 "type": "protected_path_access",
                 "severity": "high",
                 "detail": f"Protected path accessed: {path}",
             })
-        if is_boundary_violation(path, project_path):
+        elif is_boundary_violation(path, project_path, event.get("flags")):
             findings.append({
                 "type": "boundary_violation",
                 "severity": "high",
-                "detail": f"Access outside project boundary: {path}",
+                "detail": f"Write/create outside project boundary: {path}",
             })
 
     if ev_type == "execve" and argv:
@@ -366,6 +412,38 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     # README section-7 REVIEW_NEEDED signals from the git change summary.
     review_findings = detect_review_signals(git_summary)
 
+    # Informational: non-sensitive outside-project opens that are NOT violations
+    # (proven read-only), or whose operation is unknown (legacy records without
+    # flags). Routine agent/runtime reads land here instead of flooding alerts.
+    outside_read_count = 0
+    outside_unknown_count = 0
+    outside_read_paths = []
+    _seen_read = set()
+    for ev in events:
+        if ev.get("event") != "openat":
+            continue
+        p = ev.get("path", "")
+        # Establish "outside the project" by LOCATION only (do not apply the
+        # system/tool-config read-noise allowlist yet — it must not hide an open
+        # whose operation is still unknown and could be a write).
+        if (not p or is_protected_path(p) or not project_path
+                or project_path == "." or is_inside_project(p, project_path)):
+            continue
+        mut = open_flags_may_mutate(ev.get("flags"))
+        if mut is True:
+            continue  # already captured as a boundary-write finding
+        if mut is None:
+            # Operation unknown (legacy record): may be a write -> review signal,
+            # even for system/tool-config paths.
+            outside_unknown_count += 1
+        elif is_system_path(p):
+            continue  # proven read of a routine system path -> pure noise, drop
+        else:
+            outside_read_count += 1
+            if p not in _seen_read and len(outside_read_paths) < 50:
+                _seen_read.add(p)
+                outside_read_paths.append(p)
+
     # Determine safety
     has_critical = any(
         ev.get("severity") == "critical" for ev in events if ev.get("alert")
@@ -375,13 +453,18 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     has_shadow = any("/etc/shadow" in f["detail"] for f in protected_accesses)
 
     # Precedence: any UNSAFE condition wins; then the REVIEW_NEEDED signals
-    # (isolated deletions, git high-volume/build-config/deletion); then SAFE.
-    # Review signals must never mask or downgrade an UNSAFE verdict.
+    # (outside-project writes, operation-unknown outside opens, deletions, git
+    # high-volume/build-config/deletion); then SAFE. An outside-project WRITE is
+    # review-worthy, not automatically unsafe; routine outside-project READS are
+    # informational only. Operation-unknown outside opens (legacy flag-less
+    # records) cannot be ruled out as writes, so they require review too.
     if (has_critical or has_env or has_ssh or has_shadow
-            or boundary_violations or dangerous_commands
+            or dangerous_commands
             or unsafe_permission_changes or suspicious_sequences):
         safety = "UNSAFE"
-    elif file_deletions or review_findings or len(all_findings) > 0:
+    elif (boundary_violations or file_deletions or review_findings
+            or outside_unknown_count
+            or len(all_findings) > 0):
         safety = "REVIEW_NEEDED"
     else:
         safety = "SAFE"
@@ -400,7 +483,13 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     if dangerous_commands:
         recommendations.append("Review git reflog and verify destructive commands were intentional.")
     if boundary_violations:
-        recommendations.append("Investigate file access outside project boundary.")
+        recommendations.append(
+            "Review attempted writes/creates outside the project; verify any "
+            "cache/config/plugin changes were intended.")
+    if outside_unknown_count:
+        recommendations.append(
+            "Some outside-project opens had no recorded operation (legacy "
+            "events); review them since a write cannot be ruled out.")
     if unsafe_permission_changes:
         recommendations.append("Restrict world-writable permissions to the minimum required.")
     if file_deletions:
@@ -424,6 +513,9 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
         "normal_count": len(normal_activities),
         "protected_accesses": protected_accesses,
         "boundary_violations": boundary_violations,
+        "outside_project_reads": outside_read_count,
+        "outside_project_read_paths": outside_read_paths,
+        "outside_project_unknown_opens": outside_unknown_count,
         "dangerous_commands": dangerous_commands,
         "file_deletions": file_deletions,
         "unsafe_permission_changes": unsafe_permission_changes,

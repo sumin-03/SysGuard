@@ -45,12 +45,119 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 | TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
+| TASK-B-011 | P1 | **DONE** | Operation-aware boundary policy redesign (user-reported false-positive storm: a README-only Claude session graded UNSAFE with 1,653 boundary alerts, ~98% read-only). Rename `project-boundary-access` → `outside-project-write`; outside-project **reads** become informational, only **writes/creates** are a boundary violation; verdict drops generic boundary from UNSAFE → REVIEW_NEEDED. C + Python parity, plus a non-sudo C rule harness (`make test-c`). |
 
 **All 13 README canonical rules are implemented (13/13).** Remaining is P2/P3 polish/infra only: TASK-A-008 (C tests), TASK-A-009 (dirfd paths), TASK-A-011 (EXIT-based PID retirement), TASK-A-012 (comments), TASK-A-013 (ABI version policy — partly seeded by A-002's `_Static_assert`s), TASK-B-008 (git safe-empty), TASK-B-009 (malformed-JSONL counts). DONE beyond the README gap: TASK-B-010 (report aggregation). *(A-010, B-007 already DONE.)*
 
 ---
 
 ## Completed
+
+### TASK-B-011 — Operation-aware boundary policy (outside-project-write)
+*Completed 2026-07-28.*
+
+**Problem (user-reported):** running a real Claude Code session that only read
+`README.md` produced an **UNSAFE** verdict and a ~1.8 MB report. Quantified on
+the captured session (`logs/session_claude_20260727_214104.jsonl`, 3,430
+events): 1,710 alerts (~50% of events), 1,653 of them `project-boundary-access`,
+~98% read-only, and effectively 100% routine runtime paths (agent runtime,
+language toolchain, caches, cert stores, `node_modules`). Root cause: the
+"outside project root = violation" rule mislabels an AI agent's normal
+read-mostly runtime access as a boundary breach, so every real session grades
+UNSAFE and the report is unreadable.
+
+**Director consultation:** Codex recommended a *sensitivity-first,
+operation-aware* model (chosen over allowlist expansion, which is
+environment-specific and would dangerously normalize runtime writes): classify
+protected/sensitive paths first, then split outside-project opens into
+read-only (informational) vs. mutation-capable (write/create/truncate/append →
+violation). Both the C real-time engine and the Python verdict engine must move
+together to keep parity.
+
+**Approach:** shared open-flag matrix — a mutation is
+`(flags & O_ACCMODE) ∈ {O_WRONLY, O_RDWR}` **or** any of
+`O_CREAT | O_TRUNC | O_APPEND | O_TMPFILE` (so `O_RDONLY|O_CREAT`, which still
+creates, counts). Protected-path classification runs first and is unchanged, so
+`/etc/shadow`, `.env`, SSH keys, etc. still fire regardless of read/write.
+
+**Files changed (10):**
+- `app/policy.py` — added `open_flags_may_mutate`, `is_outside_project`,
+  `is_boundary_violation(path, project, flags)` helpers. `classify_event`
+  now emits a `boundary_violation` finding only for mutation-capable outside
+  opens; `evaluate_commit_safety` counts non-sensitive outside **reads** as
+  informational (`outside_project_reads` / `_read_paths`, bounded), separates
+  `outside_project_unknown_opens` (legacy flag-less records), and removes
+  generic boundary from UNSAFE — it now flows to `REVIEW_NEEDED`.
+- `src/rules.c` — `#define _GNU_SOURCE` + `<fcntl.h>`; `open_flags_may_mutate`
+  helper; boundary rule now requires a mutation flag; rule_id
+  `project-boundary-access` → `outside-project-write`; reason/recommendation
+  reworded (write/create framing).
+- `src/rules.h` — ctx doc comment updated to `outside-project-write`.
+- `app/report.py` — section 4 "Boundary Violations" → "Outside-Project Writes"
+  (aggregated, `×N`); added an informational line + sampled paths for
+  non-sensitive outside reads.
+- `src/fake_collector.c` — outside scenarios split into a read (unflagged) and
+  a write (`out.log`, `O_WRONLY|O_CREAT` → fires); **bug fix:** the OPEN case
+  now copies `scenarios[i].flags` into `ev.flags` (previously only RENAME did,
+  so open flags were always 0).
+- `tests/test_rules.c` **(new)** + `Makefile` `test-c` target — non-sudo C rule
+  harness driving `rules_evaluate()`: inside read / outside read (no alert),
+  outside write + `O_CREAT`/`O_TRUNC`/`O_APPEND` (→ `outside-project-write`),
+  protected-before-boundary precedence, system-allowlisted write. Seeds
+  TASK-A-008.
+- `tests/helpers.py`, `tests/test_policy.py`, `tests/test_report.py` — `flags`
+  default; `OperationAwareBoundaryTests` + predicate tests; report section
+  rename/read-info assertions.
+- `README.md` — §5 rule table (`outside-project-write`), §5 read/write rationale
+  note, §6 policy categories + allowlist rationale, §7 verdict table (SAFE
+  allows non-sensitive outside reads; REVIEW_NEEDED owns outside writes; generic
+  boundary removed from UNSAFE), §9 report layout, Validation row.
+
+**Verification (all non-sudo):**
+- `make clean && make` — clean, zero-warning build; `make test-c` — "C rule
+  tests: all passed".
+- Fake mode with `--project-path`: outside **read** (`report.txt`) is a plain
+  non-alert event; outside **write** (`out.log`) fires `outside-project-write`
+  (flags 0x41); protected paths still fire; no `project-boundary-access`
+  anywhere.
+- Python suite: **100 tests, OK**.
+- Re-evaluating the reported real session: **UNSAFE → REVIEW_NEEDED**, 39
+  outside writes surfaced, 1,621 outside reads summarized as informational.
+
+**Director review:** Codex reviewed the diff and raised two findings, both
+applied and re-verified:
+- **[P1]** the system-path allowlist was exempting *writes* to `/usr`, `/etc`,
+  `/opt`, ... in both engines — removed from the mutation decision (C:
+  `outside-project-write` rule; Python: `is_boundary_violation` no longer
+  routes through `is_outside_project`). The allowlist now suppresses only
+  informational reads. This surfaced ~10 additional real-session writes.
+- **[P2]** operation-unknown outside opens (flag-less legacy records) were
+  ignored by the verdict, so an unknown-only session graded SAFE — now they
+  contribute to `REVIEW_NEEDED` (matching the policy table), with a matching
+  recommendation. The dead C read-allowlist function/tables were removed to
+  keep the zero-warning build.
+
+A second review pass then caught a third finding, also applied:
+- **[P1] O_TMPFILE bit overlap** — Python folded `O_TMPFILE` into the OR-mask,
+  but on Linux `O_TMPFILE == (__O_TMPFILE | O_DIRECTORY)`, so a routine
+  read-only directory scan (`O_RDONLY | O_DIRECTORY`) matched the mask and was
+  misread as a mutation (the C engine already used whole-pattern equality).
+  Python now mirrors C: `(f & O_TMPFILE) == O_TMPFILE`, checked separately from
+  the create/trunc/append bits. Impact on the real session was large — outside
+  "writes" dropped 185 → 39 as 372 directory scans were reclassified as reads.
+
+A third pass caught a fourth finding, also applied:
+- **[P1] allowlist ordering for unknown ops** — the informational counting loop
+  applied the system/tool-config read-noise allowlist *before* the operation was
+  known, so a flag-less (unknown) open of `/etc/passwd`, `/usr/...`, or
+  `~/.gitconfig` was neither counted nor reviewed even though it could be a
+  write. The loop now establishes "outside the project" by location, classifies
+  the operation, and only drops system paths that are *proven reads*. The
+  now-unused `is_outside_project` helper was removed.
+
+A fourth review pass reported **no actionable regressions** — the diff is
+consistent across the C engine, Python policy, report, fake collector, and
+tests. Final state: 100 Python tests + `make test-c` green, zero-warning build.
 
 ### TASK-B-010 — Report-layer aggregation of repeated rows
 *Completed 2026-07-27. (User-reported UX issue, outside the original README-gap backlog.)*

@@ -40,7 +40,7 @@ POC_SRC := \
 
 LIBS := -lbpf -lelf -lz
 
-.PHONY: all poc vmlinux run-poc sysguard run clean
+.PHONY: all poc vmlinux run-poc sysguard run test-c clean
 
 # Default: build the BPF object, the skeleton, and the full engine. $(BIN)
 # already depends on $(BPF_SKEL) -> $(BPF_OBJ), so this produces all three
@@ -86,6 +86,16 @@ $(BIN): $(BPF_SKEL) $(USER_SRC) src/collector.h src/event.h src/target_filter.h
 # Build and run the full binary in live eBPF mode (needs sudo for BPF load).
 run: $(BIN)
 	sudo ./$(BIN) --output sysguard.jsonl
+
+# Non-sudo C unit tests for the rule engine (no BPF/skeleton/root needed).
+TEST_C_BIN := build/test_rules
+
+$(TEST_C_BIN): tests/test_rules.c src/rules.c src/rules.h src/event.h src/alert.h
+	mkdir -p build
+	$(CC) $(CFLAGS) -I src -o $(TEST_C_BIN) tests/test_rules.c src/rules.c
+
+test-c: $(TEST_C_BIN)
+	./$(TEST_C_BIN)
 
 clean:
 	rm -rf build

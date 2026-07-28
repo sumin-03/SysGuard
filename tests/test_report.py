@@ -133,7 +133,7 @@ class B005ReportConformanceTests(unittest.TestCase):
 
     SECTION_ORDER = [
         "Session Metadata", "Commit Safety:", "Normal Development Activity",
-        "Boundary Violations", "Protected Path Access", "Dangerous Commands",
+        "Outside-Project Writes", "Protected Path Access", "Dangerous Commands",
         "Git Status/Diff Summary", "Alert Details", "Recent Events",
         "Recommended Actions",
     ]
@@ -160,10 +160,10 @@ class B005ReportConformanceTests(unittest.TestCase):
 
     def test_canonical_sections_render_with_empty_state(self):
         rendered = self._render([make_event("openat", path="/project/a")])
-        for heading in ["Boundary Violations", "Protected Path Access",
+        for heading in ["Outside-Project Writes", "Protected Path Access",
                         "Dangerous Commands", "Alert Details", "Recent Events"]:
             self.assertIn(heading, rendered)
-        self.assertIn("No boundary violations.", rendered)
+        self.assertIn("No writes outside the project.", rendered)
         self.assertIn("No alerts or findings.", rendered)
 
     def test_recent_events_renders_every_event_type(self):
@@ -374,7 +374,29 @@ class B010AggregationTests(unittest.TestCase):
         # In Normal Activity the 3 duplicates collapse to a SINGLE escaped row
         # + a safe count (no double-escaping / duplicate rendering there).
         normal = rendered[rendered.index("Normal Development Activity"):
-                          rendered.index("Boundary Violations")]
+                          rendered.index("Outside-Project Writes")]
         self.assertEqual(normal.count(html.escape(hostile)), 1)
         self.assertIn("&times;3", normal)
         self.assertNotIn(hostile, rendered)   # raw markup never appears anywhere
+
+
+class B011OutsideProjectReportTests(unittest.TestCase):
+    """Report shows outside-project WRITES as findings and READS informationally."""
+
+    def _render(self, events, status="", diff_stat=""):
+        with mock.patch("report.get_git_summary",
+                        return_value=fake_git_summary(status=status, diff_stat=diff_stat)):
+            with tempfile.TemporaryDirectory() as directory:
+                return read_text(report.generate_report(
+                    write_jsonl(directory, events), project_path="/project"))
+
+    def test_writes_section_and_read_info_line(self):
+        import os
+        events = [make_event("openat", path=f"/home/u/.cache/r{i}.js", comm="claude")
+                  for i in range(5)]                                   # 5 outside reads
+        events.append(make_event("openat", path="/home/u/.claude/plugins/p",
+                                 flags=os.O_WRONLY, comm="claude"))    # 1 outside write
+        rendered = self._render(events)
+        self.assertIn("Outside-Project Writes", rendered)
+        self.assertIn("plugins/p", rendered)                          # write finding rendered
+        self.assertIn("Non-sensitive outside-project reads: 5", rendered)

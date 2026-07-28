@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -51,9 +52,12 @@ static struct scenario scenarios[] = {
      * name in comm and a shell in exe_path, no alert must fire. */
     {SYSGUARD_EVENT_EXEC, "sh",      "/usr/bin/bash",    "bash -c echo hello", "", 3021, 3000, 1000, "", "", 0, 0},
 
-    /* More file access: one file clearly outside the project root (fires
-     * project-boundary-access) and one project-local file (does not). */
-    {SYSGUARD_EVENT_OPEN, "cat",     "",                 "",                  "/home/user/outside-project/report.txt", 3040, 3000, 1000, "", "", 0, 0},
+    /* More file access. An outside-project READ is routine agent access and is
+     * NOT flagged; an outside-project WRITE fires outside-project-write. A
+     * project-local read is normal. (The boundary rule needs a project root, so
+     * run with --project-path /home/user/project to see the write alert.) */
+    {SYSGUARD_EVENT_OPEN, "cat",     "",                 "",                  "/home/user/outside-project/report.txt", 3040, 3000, 1000, "", "", 0, 0},                 /* read -> not flagged */
+    {SYSGUARD_EVENT_OPEN, "bash",    "",                 "",                  "/home/user/outside-project/out.log",    3041, 3000, 1000, "", "", (O_WRONLY | O_CREAT), 0}, /* write -> outside-project-write */
     {SYSGUARD_EVENT_OPEN, "claude",  "",                 "",                  "{PROJECT}/Makefile", 3000, 2500, 1000, "", "", 0, 0},
 
     /* File mutation events (unlinkat / renameat2 / fchmodat) */
@@ -156,8 +160,9 @@ void fake_collector_run(const char *output_path,
             break;
         case SYSGUARD_EVENT_EXIT:
             break;  /* payload-free session end marker */
-        default:    /* OPEN, UNLINK: single target path */
+        default:    /* OPEN, UNLINK: single target path (+ open flags for OPEN) */
             strncpy(ev.path, spath, SYSGUARD_MAX_PATH - 1);
+            ev.flags = scenarios[i].flags;
             break;
         }
 

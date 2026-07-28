@@ -1,6 +1,8 @@
+#define _GNU_SOURCE   /* expose O_TMPFILE from <fcntl.h> */
 #include "rules.h"
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -37,38 +39,13 @@ static void fill_alert(struct sysguard_alert *out, const struct sysguard_event *
     snprintf(out->recommendation, sizeof(out->recommendation), "%s", rec);
 }
 
-/* Read-only system locations every process touches at startup (loader, libs,
- * locale, /proc self-inspection, common tool config). Mirrors app/policy.py's
- * SYSTEM_PATH_PREFIXES so terminal/JSONL are not flooded with boundary HIGH
- * alerts for routine system access. Genuinely sensitive system files
- * (/etc/shadow, /etc/sudoers, ~/.ssh, ...) are still caught by the protected
- * rules above, which run first by first-match ordering. */
-static const char *system_path_prefixes[] = {
-    "/usr/", "/lib/", "/lib64/", "/opt/",
-    "/proc/", "/sys/", "/dev/", "/run/",
-    "/etc/ld.so", "/etc/locale", "/etc/nsswitch.conf",
-    "/etc/passwd", "/etc/group", "/etc/localtime",
-    "/etc/gitconfig", "/etc/gitattributes",
-    "/etc/terminfo", "/etc/inputrc", "/etc/bash",
-};
-
-/* Benign per-user tool config, matched as a substring (mirrors policy.py). */
-static const char *user_config_suffixes[] = {
-    "/.gitconfig", "/.config/git/",
-};
-
-static int path_is_system_allowlisted(const char *path) {
-    if (!path || !path[0]) return 0;
-    for (size_t i = 0; i < sizeof(system_path_prefixes) / sizeof(system_path_prefixes[0]); i++) {
-        if (strncmp(path, system_path_prefixes[i], strlen(system_path_prefixes[i])) == 0)
-            return 1;
-    }
-    for (size_t i = 0; i < sizeof(user_config_suffixes) / sizeof(user_config_suffixes[0]); i++) {
-        if (strstr(path, user_config_suffixes[i]))
-            return 1;
-    }
-    return 0;
-}
+/* Note: the C engine has no system-path READ allowlist. Reads never raise an
+ * alert here (the only openat rules are the protected-path rules and the
+ * mutation-only outside-project-write rule), so routine system reads already
+ * produce no output — an allowlist would be dead weight. System-path *writes*
+ * are intentionally NOT exempt: writing to /usr, /etc, /opt, ... is a
+ * persistence/tampering signal. The read-noise allowlist lives only in
+ * app/policy.py, where it trims the informational read sample. */
 
 /* The boundary rule is only meaningful with an absolute project root. A NULL
  * ctx, NULL/empty project_path, or a relative root ("." etc.) disables it. */
@@ -136,6 +113,22 @@ static void format_connect_endpoint(char *dst, size_t sz, const struct sysguard_
     } else {
         snprintf(dst, sz, "(unknown)");
     }
+}
+
+/* True if an openat with these flags can MUTATE the filesystem (write / create
+ * / truncate / append). O_RDONLY|O_CREAT still creates, so check the bits, not
+ * only the access mode. Must match app/policy.py's open_flags_may_mutate. */
+static int open_flags_may_mutate(int32_t flags) {
+    int acc = flags & O_ACCMODE;
+    if (acc == O_WRONLY || acc == O_RDWR)
+        return 1;
+    if (flags & (O_CREAT | O_TRUNC | O_APPEND))
+        return 1;
+#ifdef O_TMPFILE
+    if ((flags & O_TMPFILE) == O_TMPFILE)
+        return 1;
+#endif
+    return 0;
 }
 
 int rules_evaluate(const struct sysguard_event *ev,
@@ -228,20 +221,24 @@ int rules_evaluate(const struct sysguard_event *ev,
             return 1;
         }
 
-        /* project-boundary-access: openat of an absolute path outside the
+        /* outside-project-write: an openat that can MUTATE a file outside the
          * configured project root. Evaluated LAST in the OPEN branch so the
-         * specific protected-path rules above win by first-match, and skipped
-         * for routine system/tool-config paths so it does not flood alerts. */
+         * protected-path rules above win by first-match. Read-only outside-
+         * project access (an agent reading its own runtime/config/caches/certs)
+         * is routine and NOT flagged — only writes/creates are. The system
+         * allowlist deliberately does NOT apply here: writing to /usr, /etc,
+         * /opt, /run, etc. is a persistence/tampering signal, so the allowlist
+         * only ever suppresses informational reads, never mutations. */
         if (boundary_ctx_valid(ctx) &&
             ev->path[0] == '/' &&
-            !path_is_system_allowlisted(ev->path) &&
+            open_flags_may_mutate(ev->flags) &&
             !path_is_inside_project(ev->path, ctx->project_path)) {
             char reason[256];
             snprintf(reason, sizeof(reason),
-                     "File accessed outside project boundary: %s (project root %s)",
-                     ev->path, ctx->project_path);
-            fill_alert(out, ev, "project-boundary-access", SYSGUARD_SEV_HIGH,
-                       reason, "Investigate access outside the project directory.");
+                     "Write/create outside project boundary: %s (flags 0x%x, project root %s)",
+                     ev->path, (unsigned)ev->flags, ctx->project_path);
+            fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_HIGH,
+                       reason, "Verify writes/creates outside the project directory were intended.");
             return 1;
         }
     }

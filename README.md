@@ -102,7 +102,7 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 
 | Rule ID | 기준 | Severity | 설명 |
 |---|---|---:|---|
-| `project-boundary-access` | `openat` | high | project path 밖 파일 접근 |
+| `outside-project-write` | mutation-capable `openat` | high | project path 밖 파일에 대한 write/create/truncate/append 시도 |
 | `env-file-access` | `openat` | high | `.env` 계열 파일 접근 |
 | `ssh-key-access` | `openat` | critical | SSH key/config 접근 |
 | `shadow-access` | `openat` | critical | `/etc/shadow` 접근 |
@@ -116,6 +116,8 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 | `outbound-connect` | `connect` | medium | 외부 network 연결 시도 |
 | `possible-secret-exfiltration` | sequence | critical | `.env` 접근 후 외부 전송 도구 실행 |
 
+> AI agent와 그 도구체인(node, npm, git, …)은 자기 런타임·설정·캐시·인증서·node_modules 등 project 밖 파일을 **정상적으로 읽는다.** 따라서 "위치(project 밖)"만으로는 위험 신호가 되지 못한다. SysGuard는 먼저 protected(민감) path를 분류한 뒤 **읽기와 쓰기를 구분**한다. project 밖 **비민감 읽기는 위반이 아니라 정보성 증거**로 요약되고, project 밖 **write/create만** `outside-project-write` 위반으로 잡는다. protected path 접근은 read/write와 무관하게 위반이다. (system path allowlist는 이제 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지한다.)
+
 실시간 경고 예시:
 
 ```text
@@ -128,7 +130,7 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 
 JSONL event를 다음 네 범주로 분류한다.
 
-- boundary violation
+- outside-project write (+ 정보성 outside read)
 - protected path access
 - dangerous command
 - suspicious sequence
@@ -146,17 +148,22 @@ config/secrets.json
 /etc/sudoers
 ```
 
-모든 Linux process는 실행 중 `/usr`, `/lib`, `/proc`, locale, linker cache 등 많은 system path를 정상적으로 연다. 이를 전부 boundary violation으로 처리하면 정상 세션도 항상 위험으로 판정된다.
+런타임 프로세스는 repository 밖의 코드·설정·캐시·인증서 저장소·plugin·language toolchain 파일을 정상적으로 읽는다. 따라서 경로 위치만으로는 위험 신호가 되지 못한다. SysGuard는 먼저 protected path를 분류한 뒤, 읽기 전용 open과 mutation(write/create/truncate/append) open을 구분한다.
 
-SysGuard는 읽기 전용 system path allowlist와 무해한 tool configuration suffix allowlist를 적용한다. protected path는 allowlist보다 먼저 평가하므로 `/etc/shadow`, `/etc/sudoers` 등의 탐지는 유지된다.
+- project 밖 **비민감 읽기**: 정보성(위반 아님). 리포트에 건수와 소량의 sample path만 요약한다.
+- project 밖 **write/create**: `outside-project-write` (검토 대상). 런타임 디렉터리(plugin/cache 등)로의 쓰기도 persistence·변조 위험이 있어 면제하지 않는다.
+- protected path 접근: read/write 무관하게 위반.
+- flags가 없는 legacy record: operation unknown으로 별도 집계하며, 읽기로 단정하지 않는다.
+
+system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지한다.
 
 ### 7. Commit Safety 평가
 
 | 판정 | 조건 | 권고 |
 |---|---|---|
-| `SAFE` | project 내부 활동만 존재하며 위반과 위험 명령이 없음 | commit 가능 |
-| `REVIEW_NEEDED` | 명확한 위반은 없지만 다수 파일 변경, build/config 수정, sandbox 한정 삭제 등 검토 필요 | Git diff와 변경 파일 검토 |
-| `UNSAFE` | protected path 접근, boundary violation, destructive command, secret exfiltration 의심 중 하나 이상 | commit 보류, credential rotation 및 `git reflog` 확인 |
+| `SAFE` | 위반과 위험 명령이 없음. project 밖 **비민감 읽기**나 단독 network 관찰은 허용된다(정보성) | commit 가능 |
+| `REVIEW_NEEDED` | `outside-project-write`, sandbox 한정 삭제, 다수 파일 변경, build/config 수정, operation-unknown open 등 검토가 필요한 신호 | Git diff·변경 파일과 project 밖 쓰기 검토 |
+| `UNSAFE` | protected path 접근, destructive command, secret exfiltration 의심 중 하나 이상 | commit 보류, credential rotation 및 `git reflog` 확인 |
 
 `.env` 접근이 감지되면 세션은 `UNSAFE`로 승격된다. `.env`의 내용이나 secret value는 JSONL과 HTML report에 저장하지 않고 **접근 사실만** 기록한다.
 
@@ -188,7 +195,7 @@ Report는 다음 순서로 구성된다.
 1. session metadata
 2. Commit Safety badge
 3. normal development activity
-4. boundary violations
+4. outside-project writes (+ 정보성 outside read 요약)
 5. protected path access
 6. dangerous commands
 7. Git status/diff summary
@@ -657,7 +664,7 @@ echo 기반 dangerous command pattern 재현
 | GUI 기본 흐름 | fake collector `Start -> Stop -> Report` | `UNSAFE` mock report | 통과 |
 | 정상 개발 활동 | real eBPF + normal simulator, 127 events | `SAFE`, violation 0 | 통과 |
 | 위험 행위 | real eBPF + risky simulator, 40 events | `UNSAFE` | 통과: `.env` 2건, `chmod 777`, `rm -rf`, `git reset --hard` 탐지 |
-| 실제 AI agent | real eBPF + Claude Code, 4,548 events | 전체 활동 기록 | 통과: `~/.bashrc` 접근을 exec/open 양쪽에서 포착하고 boundary violation으로 판정 |
+| 실제 AI agent | real eBPF + Claude Code, 4,548 events | 전체 활동 기록 | 통과: `~/.bashrc` **읽기**는 정보성 outside-read로 요약(위반 아님), 밖으로의 write/create만 `outside-project-write`로 판정 |
 
 실제 Claude Code session에서도 project 외부 설정, 인증 관련 file, TLS certificate 등 다양한 local resource access가 관측되었다. 이 결과는 Git만으로 확인할 수 없는 agent의 local behavior를 syscall evidence로 가시화할 수 있음을 보여준다.
 
