@@ -3,6 +3,8 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <pwd.h>
+#include <unistd.h>
 #include "collector.h"
 #include "target_filter.h"
 
@@ -24,9 +26,40 @@ static void usage(const char *prog) {
         "  --target-comm <name> Scope to a process (e.g. claude) + its children\n"
         "  --target-pid <pid>   Scope to a PID + its children\n"
         "  --project-path <dir> Project root recorded for boundary analysis\n"
-        "  --session-id <id>    Session identifier (defaults to the output stem)\n",
+        "  --session-id <id>    Session identifier (defaults to the output stem)\n"
+        "  --home-path <dir>    Monitored user's home (default: the invoking\n"
+        "                       non-root user's home, SUDO_USER-aware)\n",
         prog);
     exit(1);
+}
+
+// Resolve the MONITORED user's home directory, never root's. Under sudo the
+// invoking user is recovered from SUDO_UID/SUDO_USER, so ~/.claude and friends
+// resolve to the human's home rather than /root. On failure the buffer is left
+// empty, which disables every home-relative match (fail closed).
+static void resolve_monitored_home(char *dst, size_t dst_sz) {
+    dst[0] = '\0';
+    uid_t uid = 0;
+    const char *sudo_uid = getenv("SUDO_UID");
+    if (sudo_uid && sudo_uid[0]) {
+        // Require the WHOLE value to be numeric: a malformed SUDO_UID must not
+        // silently decay to 0 (root) via strtoul's partial-parse behavior.
+        char *end = NULL;
+        unsigned long parsed = strtoul(sudo_uid, &end, 10);
+        if (!end || *end != '\0' || parsed == 0 || parsed > 0xFFFFFFFFUL)
+            return;   // malformed, or root -> no trusted home
+        uid = (uid_t)parsed;
+    } else {
+        uid = geteuid();
+    }
+    // Root has no "monitored user" home: never trust /root for the home-relative
+    // exemptions, or a write under /root could be silently exempted.
+    if (uid == 0)
+        return;
+    struct passwd *pw = getpwuid(uid);
+    if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/' || !pw->pw_dir[1])
+        return;   // lookup failed, or the home is unusable ("/" / relative)
+    snprintf(dst, dst_sz, "%s", pw->pw_dir);
 }
 
 // Derive a session id from the output path when --session-id is omitted:
@@ -45,6 +78,7 @@ int main(int argc, char **argv) {
     const char *target_comm = NULL;
     const char *project_path = NULL;
     const char *session_id = NULL;
+    const char *home_path = NULL;
     unsigned long target_pid = 0;
     int fake = 0;
     int agent_mode = 0;
@@ -69,6 +103,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--session-id") == 0) {
             if (++i >= argc) usage(argv[0]);
             session_id = argv[i];
+        } else if (strcmp(argv[i], "--home-path") == 0) {
+            if (++i >= argc) usage(argv[0]);
+            home_path = argv[i];
         } else {
             usage(argv[0]);
         }
@@ -90,6 +127,10 @@ int main(int argc, char **argv) {
         snprintf(session.project_path, sizeof(session.project_path), "%s", project_path);
     if (target_comm)
         snprintf(session.target_comm, sizeof(session.target_comm), "%s", target_comm);
+    if (home_path)
+        snprintf(session.home_path, sizeof(session.home_path), "%s", home_path);
+    else
+        resolve_monitored_home(session.home_path, sizeof(session.home_path));
     session.agent_mode = agent_mode;
 
     signal(SIGINT, sig_handler);
@@ -104,11 +145,14 @@ int main(int argc, char **argv) {
     if (session.target_comm[0])  printf("  Target  : comm=%s\n", session.target_comm);
     if (target_pid)              printf("  Target  : pid=%lu\n", target_pid);
     if (session.project_path[0]) printf("  Project : %s\n", session.project_path);
+    if (session.home_path[0])    printf("  Home    : %s\n", session.home_path);
+    else                         printf("  Home    : (untrusted - home-relative rules disabled)\n");
     if (agent_mode)              printf("  Agent   : on\n");
     printf("========================================\n\n");
 
     if (fake) {
-        fake_collector_run(output, session.session_id, project_path, target_comm);
+        fake_collector_run(output, session.session_id, project_path, target_comm,
+                           session.home_path);
     } else {
 #ifdef HAS_BPF_COLLECTOR
         // Scope live collection to the target's process subtree. With no target

@@ -363,3 +363,207 @@ class OperationAwareBoundaryTests(unittest.TestCase):
         self.assertEqual(r["safety"], "SAFE")
         self.assertEqual(r["outside_project_reads"], 0)
         self.assertEqual(r["outside_project_unknown_opens"], 0)
+
+
+class B012EffectAwareWriteTests(unittest.TestCase):
+    """TASK-B-012: outside writes classified by EFFECT, not just location.
+
+    runtime bookkeeping -> informational | persistence/activation -> UNSAFE |
+    anything else outside the project -> REVIEW_NEEDED.
+    """
+
+    HOME = "/home/u"
+
+    def _open(self, path, flags=os.O_RDONLY, **kw):
+        return make_event("openat", path=path, project_path="/project",
+                          comm="claude", flags=flags, **kw)
+
+    def _verdict(self, events, home=None):
+        return policy.evaluate_commit_safety(
+            events, "/project", home_path=self.HOME if home is None else home)
+
+    # --- runtime bookkeeping noise -> SAFE ---------------------------------
+    def test_runtime_noise_writes_are_safe(self):
+        for p in [
+            "/home/u/.claude/projects/s.jsonl", "/home/u/.claude/sessions/1.json",
+            "/home/u/.claude/backups/b", "/home/u/.claude/history.jsonl",
+            "/home/u/.claude/session-env/x/hook.sh", "/home/u/.claude/plugins/cache/p",
+            "/home/u/.npm/_cacache/x", "/home/u/.npm/_logs/x.log",
+            "/home/u/.cache/claude-cli-nodejs/x.jsonl",
+            "/home/u/.config/Code/logs/x/cli.log",
+            "/home/u/.claude.json.tmp.426628.ba9822eb",
+            "/dev/null", "/dev/tty", "/sys/kernel/debug/tracing/trace_marker",
+        ]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_WRONLY | os.O_CREAT)])
+                self.assertEqual(r["safety"], "SAFE")
+                self.assertEqual(r["boundary_violations"], [])
+                self.assertEqual(len(r["runtime_noise_writes"]), 1)
+
+    # --- near misses must NOT be exempted ----------------------------------
+    def test_near_miss_paths_stay_review_needed(self):
+        for p in [
+            "/home/u/.npmrc", "/home/u/.cache/other/x", "/home/u/evil.tmp",
+            "/home/u/.claude/plugins/evil", "/home/u/.claude/x",
+            "/home/u/.claude.json.tmp.notapid.zz",
+            "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
+            "/usr/lib/x.so",
+        ]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_WRONLY | os.O_CREAT)])
+                self.assertEqual(r["safety"], "REVIEW_NEEDED")
+                self.assertEqual(len(r["boundary_violations"]), 1)
+
+    # --- persistence / activation -> UNSAFE --------------------------------
+    def test_persistence_writes_are_unsafe(self):
+        for p in [
+            "/home/u/.bashrc", "/home/u/.zshrc", "/home/u/.profile", "/home/u/.zshenv",
+            "/home/u/.gitconfig", "/home/u/.config/git/config",
+            "/home/u/.claude.json", "/home/u/.claude/settings.json",
+            "/home/u/.claude/settings.local.json", "/home/u/.ssh/authorized_keys",
+            "/home/u/.config/autostart/x.desktop",
+            "/home/u/.config/systemd/user/x.service",
+            "/home/u/.local/share/systemd/user/x.service",
+            "/home/u/.config/environment.d/x.conf",
+            "/etc/crontab", "/etc/cron.d/x", "/var/spool/cron/crontabs/u",
+            "/etc/systemd/system/x.service", "/etc/profile", "/etc/profile.d/x.sh",
+            "/etc/ld.so.preload", "/etc/ld.so.conf.d/x.conf",
+            "/project/.git/hooks/pre-commit",
+        ]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_WRONLY)])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["persistence_writes"]), 1)
+
+    def test_persistence_reads_are_ordinary(self):
+        # A shell reads .bashrc on every invocation — reading is not a signal.
+        for p in ["/home/u/.bashrc", "/home/u/.zshrc", "/home/u/.claude.json"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_RDONLY)])
+                self.assertEqual(r["safety"], "SAFE")
+                self.assertEqual(r["persistence_writes"], [])
+
+    # --- precedence ---------------------------------------------------------
+    def test_protected_beats_persistence_and_noise(self):
+        r = self._verdict([self._open("/home/u/.ssh/id_rsa", os.O_WRONLY)])
+        self.assertEqual(r["safety"], "UNSAFE")
+        self.assertEqual(len(r["protected_accesses"]), 1)
+        self.assertEqual(r["persistence_writes"], [])
+        self.assertEqual(r["boundary_violations"], [])
+
+    def test_unknown_operation_on_noise_path_is_not_exempted(self):
+        ev = self._open("/home/u/.claude/projects/s.jsonl")
+        del ev["flags"]
+        r = self._verdict([ev])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(r["outside_project_unknown_opens"], 1)
+        self.assertEqual(r["runtime_noise_writes"], [])
+
+    # --- atomic replace -----------------------------------------------------
+    def test_rename_onto_persistence_target_is_unsafe(self):
+        ev = make_event("renameat2", path="", project_path="/project", comm="claude",
+                        old_path="/home/u/.claude.json.tmp.42.ab",
+                        new_path="/home/u/.claude.json")
+        r = self._verdict([ev])
+        self.assertEqual(r["safety"], "UNSAFE")
+        self.assertEqual(len(r["persistence_writes"]), 1)
+
+    def test_rename_within_noise_is_not_a_finding(self):
+        ev = make_event("renameat2", path="", project_path="/project", comm="claude",
+                        old_path="/home/u/.claude/projects/a",
+                        new_path="/home/u/.claude/projects/b")
+        self.assertEqual(self._verdict([ev])["safety"], "SAFE")
+
+    # --- fail-closed home ---------------------------------------------------
+    def test_untrusted_home_disables_home_relative_exemptions(self):
+        # No trusted home -> a bookkeeping write is reported, never silently
+        # dropped. Absolute persistence paths still apply.
+        noise = self._open("/home/u/.claude/projects/s.jsonl", os.O_WRONLY)
+        self.assertEqual(self._verdict([noise], home="")["safety"], "REVIEW_NEEDED")
+        cron = self._open("/etc/cron.d/x", os.O_WRONLY)
+        self.assertEqual(self._verdict([cron], home="")["safety"], "UNSAFE")
+        # /dev/null is absolute, so it stays exempt with no home.
+        devnull = self._open("/dev/null", os.O_WRONLY)
+        self.assertEqual(self._verdict([devnull], home="")["safety"], "SAFE")
+
+    def test_home_resolution_ignores_root_only_sessions(self):
+        # Only root activity -> no trusted monitored home -> fail closed.
+        self.assertIsNone(policy.resolve_monitored_home(
+            [make_event("openat", uid=0, path="/home/u/.claude/projects/x")]))
+        # A normal uid resolves to that user's passwd home.
+        import pwd
+        uid = os.getuid()
+        if uid > 0:
+            self.assertEqual(
+                policy.resolve_monitored_home([make_event("openat", uid=uid)]),
+                pwd.getpwuid(uid).pw_dir.rstrip("/"))
+
+    # --- the protected-verdict bug fixed in this task -----------------------
+    def test_every_protected_path_forces_unsafe(self):
+        # Previously only .env/.ssh/shadow were promoted; AWS creds and sudoers
+        # leaked through as REVIEW_NEEDED.
+        for p in ["/home/u/.aws/credentials", "/etc/sudoers",
+                  "/project/config/secrets.json", "/project/.env"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_RDONLY)])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertTrue(r["recommendations"])
+
+    # --- path traversal must not defeat the exemption (Codex review) --------
+    def test_traversal_cannot_win_a_runtime_exemption(self):
+        # A noise prefix followed by ".." resolves somewhere else entirely.
+        r = self._verdict([self._open(
+            "/home/u/.claude/projects/../../.bashrc", os.O_WRONLY)])
+        self.assertEqual(r["safety"], "UNSAFE")          # resolves to ~/.bashrc
+        self.assertEqual(r["runtime_noise_writes"], [])
+        r = self._verdict([self._open(
+            "/home/u/.claude/projects/../evil", os.O_WRONLY | os.O_CREAT)])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")   # exemption refused
+        self.assertEqual(r["runtime_noise_writes"], [])
+        r = self._verdict([self._open(
+            "/home/u/.npm/_logs/../../.ssh/authorized_keys", os.O_WRONLY)])
+        self.assertEqual(r["safety"], "UNSAFE")
+
+    def test_recorded_home_from_collector_wins(self):
+        # The collector's home_path must drive the report so live alerts and the
+        # rendered verdict cannot disagree (e.g. when --home-path was used).
+        ev = make_event("openat", path="/opt/agent/.claude/projects/s.jsonl",
+                        project_path="/project", comm="claude", uid=os.getuid(),
+                        flags=os.O_WRONLY, home_path="/opt/agent")
+        r = policy.evaluate_commit_safety([ev], "/project")
+        self.assertEqual(r["monitored_home"], "/opt/agent")
+        self.assertEqual(r["safety"], "SAFE")          # classified as noise
+    def test_collector_fail_closed_home_is_authoritative(self):
+        # An EMPTY recorded home means the collector deliberately failed closed;
+        # the report must not re-derive a home from uid and become more
+        # permissive than the live engine.
+        ev = make_event("openat", path="/opt/agent/.claude/projects/s.jsonl",
+                        project_path="/project", comm="claude", uid=os.getuid(),
+                        flags=os.O_WRONLY, home_path="")
+        r = policy.evaluate_commit_safety([ev], "/project")
+        self.assertIsNone(r["monitored_home"])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        # A malformed recorded value is likewise authoritative (fail closed).
+        ev2 = make_event("openat", path="/x", project_path="/project",
+                         comm="claude", uid=os.getuid(), home_path="relative")
+        self.assertIsNone(policy.resolve_monitored_home([ev2]))
+        # Only a record with NO home_path field at all falls back to uid.
+        ev3 = make_event("openat", path="/x", project_path="/project",
+                         comm="claude", uid=os.getuid())
+        ev3.pop("home_path", None)
+        self.assertEqual(policy.resolve_monitored_home([ev3]),
+                         __import__("pwd").getpwuid(os.getuid()).pw_dir.rstrip("/"))
+
+    def test_rename_onto_protected_destination_is_unsafe(self):
+        # Staging inside an exempt runtime dir then renaming onto credentials
+        # must not slip through: protected precedence applies to the destination.
+        for dest in ["/home/u/.aws/credentials", "/project/.env", "/etc/sudoers",
+                     "/home/u/.ssh/id_rsa"]:
+            with self.subTest(dest=dest):
+                ev = make_event("renameat2", path="", project_path="/project",
+                                comm="claude",
+                                old_path="/home/u/.claude/projects/stage",
+                                new_path=dest)
+                r = self._verdict([ev])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["protected_accesses"]), 1)

@@ -33,14 +33,42 @@ static struct sysguard_event mk_open(const char *path, int flags)
     return e;
 }
 
+/* Monitored home used by the home-relative parity rows (mirrors test_policy.py). */
+#define HOME "/home/u"
+
 /* Return the rule_id fired for an event under project root P, or NULL. */
 static const char *rule_of(struct sysguard_event *e, const char *project)
 {
     static struct sysguard_alert a;
-    struct sysguard_rule_ctx ctx = { project };
+    struct sysguard_rule_ctx ctx = { project, HOME };
     if (rules_evaluate(e, &ctx, &a))
         return a.rule_id;
     return NULL;
+}
+
+/* Same, but with an untrusted/absent home: every home-relative match must be
+ * disabled (fail-closed), so noise writes fall back to outside-project-write. */
+static const char *rule_of_nohome(struct sysguard_event *e, const char *project)
+{
+    static struct sysguard_alert a;
+    struct sysguard_rule_ctx ctx = { project, NULL };
+    if (rules_evaluate(e, &ctx, &a))
+        return a.rule_id;
+    return NULL;
+}
+
+static struct sysguard_event mk_rename(const char *old_path, const char *new_path)
+{
+    struct sysguard_event e;
+    memset(&e, 0, sizeof(e));
+    e.type = SYSGUARD_EVENT_RENAME;
+    e.pid = 100;
+    e.ppid = 1;
+    e.uid = 1000;
+    strncpy(e.comm, "claude", sizeof(e.comm) - 1);
+    strncpy(e.old_path, old_path, sizeof(e.old_path) - 1);
+    strncpy(e.new_path, new_path, sizeof(e.new_path) - 1);
+    return e;
 }
 
 static int is(const char *got, const char *want)
@@ -93,6 +121,109 @@ int main(void)
     CHECK(is(rule_of(&e, P), "outside-project-write"));
     e = mk_open("/etc/passwd", O_WRONLY);   /* not protected, but a write to /etc */
     CHECK(is(rule_of(&e, P), "outside-project-write"));
+
+    /* ---- TASK-B-012 parity matrix (mirrors tests/test_policy.py) ---------- */
+
+    /* Runtime bookkeeping WRITES -> informational, no alert. */
+    const char *noise[] = {
+        HOME "/.claude/projects/s.jsonl", HOME "/.claude/sessions/1.json",
+        HOME "/.claude/backups/b", HOME "/.claude/history.jsonl",
+        HOME "/.claude/session-env/x/hook.sh", HOME "/.claude/plugins/cache/p",
+        HOME "/.npm/_cacache/x", HOME "/.npm/_logs/x.log",
+        HOME "/.cache/claude-cli-nodejs/x.jsonl", HOME "/.config/Code/logs/x/cli.log",
+        HOME "/.claude.json.tmp.426628.ba9822eb",
+        "/dev/null", "/dev/tty", "/sys/kernel/debug/tracing/trace_marker",
+    };
+    for (size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++) {
+        e = mk_open(noise[i], O_WRONLY | O_CREAT);
+        if (rule_of(&e, P) != NULL)
+            printf("  FAIL: expected no alert for %s\n", noise[i]), failures++;
+    }
+
+    /* Near misses must NOT be exempted -> outside-project-write. */
+    const char *near_miss[] = {
+        HOME "/.npmrc", HOME "/.cache/other/x", HOME "/evil.tmp",
+        HOME "/.claude/plugins/evil", HOME "/.claude/x",
+        HOME "/.claude.json.tmp.notapid.zz",     /* malformed staging name */
+        "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
+    };
+    for (size_t i = 0; i < sizeof(near_miss) / sizeof(near_miss[0]); i++) {
+        e = mk_open(near_miss[i], O_WRONLY | O_CREAT);
+        if (!is(rule_of(&e, P), "outside-project-write"))
+            printf("  FAIL: expected outside-project-write for %s\n", near_miss[i]), failures++;
+    }
+
+    /* Persistence/activation WRITES -> persistence-sensitive-write (critical). */
+    const char *persist[] = {
+        HOME "/.bashrc", HOME "/.zshrc", HOME "/.profile", HOME "/.zshenv",
+        HOME "/.gitconfig", HOME "/.config/git/config",
+        HOME "/.claude.json", HOME "/.claude/settings.json",
+        HOME "/.claude/settings.local.json",
+        HOME "/.ssh/authorized_keys",
+        HOME "/.config/autostart/x.desktop", HOME "/.config/systemd/user/x.service",
+        HOME "/.local/share/systemd/user/x.service", HOME "/.config/environment.d/x.conf",
+        "/etc/crontab", "/etc/cron.d/x", "/var/spool/cron/crontabs/u",
+        "/etc/systemd/system/x.service", "/etc/profile", "/etc/profile.d/x.sh",
+        "/etc/ld.so.preload", "/etc/ld.so.conf.d/x.conf",
+        "/project/.git/hooks/pre-commit",   /* inside the project, still persistence */
+    };
+    for (size_t i = 0; i < sizeof(persist) / sizeof(persist[0]); i++) {
+        e = mk_open(persist[i], O_WRONLY);
+        if (!is(rule_of(&e, P), "persistence-sensitive-write"))
+            printf("  FAIL: expected persistence-sensitive-write for %s\n", persist[i]), failures++;
+    }
+
+    /* READS of persistence targets are ordinary (a shell reads .bashrc always). */
+    e = mk_open(HOME "/.bashrc", O_RDONLY);
+    CHECK(rule_of(&e, P) == NULL);
+    e = mk_open(HOME "/.claude.json", O_RDONLY);
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* Precedence: protected beats persistence and noise. */
+    e = mk_open(HOME "/.ssh/id_rsa", O_WRONLY);
+    CHECK(is(rule_of(&e, P), "ssh-key-access"));
+
+    /* Atomic replace: rename ONTO a persistence target is critical, and the
+     * destination — not the exempt staging source — decides. */
+    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/.claude/projects/a", HOME "/.claude/projects/b");
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* A rename onto a PROTECTED destination keeps protected precedence, so a
+     * file staged in an exempt runtime dir cannot replace credentials silently. */
+    e = mk_rename(HOME "/.claude/projects/stage", HOME "/.aws/credentials");
+    CHECK(is(rule_of(&e, P), "aws-credentials-access"));
+    e = mk_rename(HOME "/.claude/projects/stage", "/project/.env");
+    CHECK(is(rule_of(&e, P), "env-file-access"));
+    e = mk_rename(HOME "/.claude/projects/stage", "/etc/sudoers");
+    CHECK(is(rule_of(&e, P), "sudoers-access"));
+    e = mk_rename(HOME "/.claude/projects/stage", HOME "/.ssh/id_rsa");
+    CHECK(is(rule_of(&e, P), "ssh-key-access"));
+
+    /* Path traversal must not defeat the exemption or the persistence rule:
+     * a noise prefix followed by ".." resolves elsewhere, so the exemption is
+     * refused (fail closed) and the resolved persistence target still fires. */
+    e = mk_open(HOME "/.claude/projects/../../.bashrc", O_WRONLY);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_open(HOME "/.claude/projects/../evil", O_WRONLY | O_CREAT);
+    CHECK(is(rule_of(&e, P), "outside-project-write"));
+    e = mk_open(HOME "/.npm/_logs/../../.ssh/authorized_keys", O_WRONLY);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+
+    /* Fail-closed: without a trusted home, home-relative exemptions are OFF, so
+     * a bookkeeping write is reported rather than silently dropped. */
+    e = mk_open(HOME "/.claude/projects/s.jsonl", O_WRONLY | O_CREAT);
+    CHECK(is(rule_of_nohome(&e, P), "outside-project-write"));
+    /* ...and home-relative persistence is likewise not claimed (still reported). */
+    e = mk_open(HOME "/.bashrc", O_WRONLY);
+    CHECK(is(rule_of_nohome(&e, P), "outside-project-write"));
+    /* Absolute persistence paths do not depend on home. */
+    e = mk_open("/etc/cron.d/x", O_WRONLY);
+    CHECK(is(rule_of_nohome(&e, P), "persistence-sensitive-write"));
+    /* Absolute no-op sinks likewise stay exempt without a home. */
+    e = mk_open("/dev/null", O_WRONLY);
+    CHECK(rule_of_nohome(&e, P) == NULL);
 
     if (failures == 0) {
         printf("C rule tests: all passed\n");

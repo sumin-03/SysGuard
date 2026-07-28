@@ -108,7 +108,8 @@ static void log_event(const struct sysguard_event *e, void *ctx)
         return;
 
     struct sysguard_alert alert;
-    struct sysguard_rule_ctx rctx = { lc->session->project_path };
+    struct sysguard_rule_ctx rctx = { lc->session->project_path,
+                                      lc->session->home_path };
     if (rules_evaluate(&ev, &rctx, &alert)) {
         printf("  [%s] %s — %s\n",
                sysguard_severity_string(alert.severity),
@@ -116,12 +117,14 @@ static void log_event(const struct sysguard_event *e, void *ctx)
         jsonl_write_alert(lc->fp, &ev, &alert,
                           lc->session->session_id,
                           lc->session->project_path,
-                          lc->session->target_comm);
+                          lc->session->target_comm,
+                          lc->session->home_path);
     } else {
         jsonl_write_event(lc->fp, &ev,
                           lc->session->session_id,
                           lc->session->project_path,
-                          lc->session->target_comm);
+                          lc->session->target_comm,
+                          lc->session->home_path);
     }
     fflush(lc->fp);
 }

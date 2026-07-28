@@ -7,7 +7,8 @@
 void fake_collector_run(const char *output_path,
                         const char *session_id,
                         const char *project_path,
-                        const char *target_comm);
+                        const char *target_comm,
+                        const char *home_path);
 
 // Session-level metadata, constant for one monitoring run. main.c fills this
 // from CLI options and hands it to the collector so every JSONL record can
@@ -16,6 +17,10 @@ struct sysguard_session {
     char session_id[64];                 // Matches the GUI's log file stem.
     char project_path[SYSGUARD_MAX_PATH]; // Repo root for boundary checks.
     char target_comm[TASK_COMM_LEN];     // Monitored agent (e.g. "claude").
+    char home_path[SYSGUARD_MAX_PATH];   // MONITORED user's home (not root's)
+                                         // for home-relative persistence and
+                                         // runtime-noise matching. Empty when it
+                                         // cannot be trusted -> fail closed.
     int  agent_mode;                     // 1 if --agent-mode was requested.
 };
 

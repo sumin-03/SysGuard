@@ -45,6 +45,7 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 | TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
+| TASK-B-012 | P1 | **DONE** | Effect-aware write policy (user-reported: a `"read README.md"` session still graded REVIEW_NEEDED on 35 agent/toolchain bookkeeping writes). Split outside writes into runtime-noise (informational) / ordinary (`REVIEW_NEEDED`) / persistence-activation (`persistence-sensitive-write`, UNSAFE); trusted monitored-home with fail-closed; fixed the protected-verdict leak (AWS creds, sudoers). |
 | TASK-B-011 | P1 | **DONE** | Operation-aware boundary policy redesign (user-reported false-positive storm: a README-only Claude session graded UNSAFE with 1,653 boundary alerts, ~98% read-only). Rename `project-boundary-access` → `outside-project-write`; outside-project **reads** become informational, only **writes/creates** are a boundary violation; verdict drops generic boundary from UNSAFE → REVIEW_NEEDED. C + Python parity, plus a non-sudo C rule harness (`make test-c`). |
 
 **All 13 README canonical rules are implemented (13/13).** Remaining is P2/P3 polish/infra only: TASK-A-008 (C tests), TASK-A-009 (dirfd paths), TASK-A-011 (EXIT-based PID retirement), TASK-A-012 (comments), TASK-A-013 (ABI version policy — partly seeded by A-002's `_Static_assert`s), TASK-B-008 (git safe-empty), TASK-B-009 (malformed-JSONL counts). DONE beyond the README gap: TASK-B-010 (report aggregation). *(A-010, B-007 already DONE.)*
@@ -52,6 +53,77 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-B-012 — Effect-aware write policy (runtime noise vs. persistence)
+*Completed 2026-07-28.*
+
+**Problem (user-reported):** after TASK-B-011, a real Claude session whose only
+prompt was `"read README.md"` still graded **REVIEW_NEEDED** — driven solely by
+35 outside-project writes (protected 0, dangerous 0, deletions 0). All 35 were
+agent/toolchain bookkeeping: 17× `~/.claude/` session state, 6× `/dev/null`,
+4× `~/.claude.json.tmp.<pid>.<hex>` atomic staging, 3× `~/.npm` cache/logs,
+2× `~/.cache/claude-cli-nodejs/`, 2× `~/.config/Code/logs/`, 1× kernel
+`trace_marker`. B-011's "reads = noise, writes = signal" had a blind spot: the
+agent's OWN runtime writes are noise too.
+
+**Director consultation:** Codex rejected a blanket write allowlist and
+prescribed classification by **effect**, with the guardrail that "cache",
+"agent-owned", and "pseudo-filesystem" must never become synonyms for "safe".
+
+**Approach — five buckets, one precedence, both engines:**
+1. protected/credential access (read or write) → `UNSAFE`
+2. persistence/activation **mutation** → `persistence-sensitive-write` → `UNSAFE`
+   (reads stay ordinary — a shell reads `.bashrc` on every invocation)
+3. inside the project → no finding
+4. operation-unknown outside open → `REVIEW_NEEDED`, never exempted
+5. proven outside mutation → runtime-noise match ? informational : `REVIEW_NEEDED`
+
+Matching is exact / prefix / component-aware only (no `"/.cache/"` substrings).
+Home-relative rules use the **monitored** user's home — `SUDO_UID`-aware in C,
+the recorded `home_path` JSONL field in Python — and fail closed when it is
+absent, malformed, or root.
+
+**Files changed (13):** `app/policy.py` (bucket tables, `resolve_monitored_home`,
+`is_runtime_noise_write`, `is_persistence_sensitive`, rename-by-destination,
+verdict rewrite), `src/rules.c` (mirrored tables, `persistence-sensitive-write`,
+rename branch, lexical normalizer, `path_protected_rule`), `src/rules.h`,
+`src/collector.h`, `src/main.c` (`--home-path` + sudo-aware resolution),
+`src/jsonl_writer.{c,h}` (additive `home_path` field), `src/bpf_collector.c`,
+`src/fake_collector.c` (`{HOME}` sentinel + persistence/noise demo scenarios),
+`README.md`, `docs/TASKS.md`, `tests/test_{policy,report,rules}.py|c`.
+
+**Fixed along the way:** the Python verdict only promoted `.env`/`.ssh`/
+`/etc/shadow`, so **AWS credentials and sudoers leaked through as
+REVIEW_NEEDED**; it now uses `bool(protected_accesses)`.
+
+**Verification (all non-sudo):** clean zero-warning build; `make test-c` all
+passed (parity matrix: 14 noise rows, 10 near-miss rows, 23 persistence rows,
+precedence, traversal, fail-closed home, rename destinations); **117 Python
+tests OK**; fake demo shows `~/.bashrc` **write** = critical while the **read**
+of the same file is silent. **The reported session now grades `SAFE` with a
+37 KB report** (was REVIEW_NEEDED; the original B-011-era report was 1.8 MB).
+
+**Director review:** five passes. Four findings raised and all applied —
+(1) traversal (`.claude/projects/../../.bashrc`) defeated the lexical exemption
+→ dot-segment paths are refused an exemption and normalized before persistence
+matching, in both engines; (2) `SUDO_UID=0`/malformed accepted root's `/root`
+→ full numeric validation + non-zero requirement; (3) the collector's home was
+not serialized, so the report could re-derive a different one → additive
+`home_path` JSONL field, and an **empty** recorded value is authoritative
+(fail-closed) rather than re-derived; (4) a staging file renamed onto a
+protected path (`.env`, `~/.aws/credentials`, `/etc/sudoers`) bypassed all
+alerts → protected precedence now applies to rename destinations (this added
+the `aws-credentials-access` / `secrets-file-access` rule IDs to the C engine
+for parity with Python's `PROTECTED_PATHS`; documented in README §5). Final
+pass: no actionable regressions.
+
+**Known limitation (accepted, documented in README §6):**
+`~/.claude/session-env/` (sourceable scripts) and `~/.claude/plugins/cache/`
+(executable plugin content) are exempted by path alone — a cache-poisoning /
+session-script false-negative tradeoff taken to keep routine sessions readable.
+A hardened profile would require session-created runtime roots plus integrity
+verification. Exempted writes still always appear in the report with counts and
+representative paths.
 
 ### TASK-B-011 — Operation-aware boundary policy (outside-project-write)
 *Completed 2026-07-28.*

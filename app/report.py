@@ -222,26 +222,42 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         h += "<p>No normal activity recorded.</p>\n"
     h += "</div>\n"
 
-    # 4. Outside-Project Writes — write/create opens outside the project root.
-    # Read-only outside-project access is routine agent/runtime behaviour and is
-    # summarized informationally below, not treated as a violation.
-    h += '<div class="section"><h2>&#128683; Outside-Project Writes</h2>\n'
+    # 4. Outside-Project Mutations — outside/at-boundary writes split by EFFECT:
+    # review-worthy writes, then narrowly recognized runtime bookkeeping and
+    # read-only access as informational context. Persistence-sensitive writes are
+    # escalated and rendered in their own section below.
+    h += '<div class="section"><h2>&#128683; Outside-Project Mutations</h2>\n'
+    h += "<h3>Review-worthy outside writes</h3>\n"
     if safety["boundary_violations"]:
         h += "<ul>\n"
         for f, n in aggregate_for_display(safety["boundary_violations"], lambda x: x["detail"]):
             h += f'  <li>{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n"
     else:
-        h += '<p class="empty">No writes outside the project.</p>\n'
+        h += '<p class="empty">No review-worthy writes outside the project.</p>\n'
+
+    noise = safety.get("runtime_noise_writes", [])
+    if noise:
+        h += "<h3>Runtime bookkeeping writes &mdash; informational</h3>\n"
+        h += (f'<p class="empty">Observed {len(noise)} known runtime-bookkeeping '
+              'write(s); these did not target protected, persistence-sensitive, or '
+              'ordinary user paths, so they do not affect the verdict.</p>\n')
+        h += "<ul>\n"
+        for f, n in aggregate_for_display(noise, lambda x: x["detail"])[:20]:
+            h += f'  <li class="empty">{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
+        h += "</ul>\n"
+
     reads = safety.get("outside_project_reads", 0)
     unknown = safety.get("outside_project_unknown_opens", 0)
     read_paths = safety.get("outside_project_read_paths", [])
     if reads or unknown:
+        h += "<h3>Outside reads and unknown-operation opens</h3>\n"
         note = (f'Non-sensitive outside-project reads: {reads} event(s)'
                 f'{", " + str(len(read_paths)) + " unique path(s) sampled below" if read_paths else ""}'
                 ' — routine runtime access, not treated as violations.')
         if unknown:
-            note += f' Unknown-operation opens (legacy records): {unknown}.'
+            note += (f' Unknown-operation opens (legacy records): {unknown} — these '
+                     'require review because a write cannot be ruled out.')
         h += f'<p class="empty">{html.escape(note)}</p>\n'
         if read_paths:
             h += "<ul>\n"
@@ -249,6 +265,18 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
                 h += f'  <li class="empty">{html.escape(p)}</li>\n'
             h += "</ul>\n"
     h += "</div>\n"
+
+    # 4b. Persistence-Sensitive Writes — mutations of shell startup files, cron,
+    # systemd units, autostart, git hooks, or live agent config. Only rendered
+    # when present; each one forces UNSAFE.
+    if safety.get("persistence_writes"):
+        h += '<div class="section"><h2>&#9888;&#65039; Persistence-Sensitive Writes</h2>\n'
+        h += ('<p>A write targeted a location that can execute or activate code on '
+              'a later run. Inspect each target for injected commands.</p>\n')
+        h += "<ul>\n"
+        for f, n in aggregate_for_display(safety["persistence_writes"], lambda x: x["detail"]):
+            h += f'  <li>{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
+        h += "</ul>\n</div>\n"
 
     # 5. Protected Path Access — always rendered.
     h += '<div class="section"><h2>&#128274; Protected Path Access</h2>\n'

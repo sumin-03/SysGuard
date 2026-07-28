@@ -102,7 +102,12 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 
 | Rule ID | 기준 | Severity | 설명 |
 |---|---|---:|---|
-| `outside-project-write` | mutation-capable `openat` | high | project path 밖 파일에 대한 write/create/truncate/append 시도 |
+| `outside-project-write` | mutation-capable `openat` | high | project path 밖 파일에 대한 write/create/truncate/append 시도 (런타임 bookkeeping 제외) |
+| `persistence-sensitive-write` | mutation-capable `openat` / `renameat2` | critical | shell 시작 파일, `authorized_keys`, cron, systemd unit, autostart, git hook, 활성 agent config 등 **나중에 코드를 실행·활성화**시키는 대상에 대한 쓰기 |
+| `aws-credentials-access` | `renameat2` destination | critical | `~/.aws/credentials`를 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
+| `secrets-file-access` | `renameat2` destination | high | `config/secrets.json`을 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
+
+> `renameat2`는 **목적지(destination)** 기준으로 open과 동일한 우선순위(protected → persistence)를 적용한다. 면제된 runtime 디렉터리에 staging 파일을 만든 뒤 `.env`나 credentials로 rename하는 우회를 막기 위함이며, 이 두 rule은 그 parity를 위해 C 엔진에 추가되었다(Python은 이미 `PROTECTED_PATHS`로 처리 중).
 | `env-file-access` | `openat` | high | `.env` 계열 파일 접근 |
 | `ssh-key-access` | `openat` | critical | SSH key/config 접근 |
 | `shadow-access` | `openat` | critical | `/etc/shadow` 접근 |
@@ -116,7 +121,15 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 | `outbound-connect` | `connect` | medium | 외부 network 연결 시도 |
 | `possible-secret-exfiltration` | sequence | critical | `.env` 접근 후 외부 전송 도구 실행 |
 
-> AI agent와 그 도구체인(node, npm, git, …)은 자기 런타임·설정·캐시·인증서·node_modules 등 project 밖 파일을 **정상적으로 읽는다.** 따라서 "위치(project 밖)"만으로는 위험 신호가 되지 못한다. SysGuard는 먼저 protected(민감) path를 분류한 뒤 **읽기와 쓰기를 구분**한다. project 밖 **비민감 읽기는 위반이 아니라 정보성 증거**로 요약되고, project 밖 **write/create만** `outside-project-write` 위반으로 잡는다. protected path 접근은 read/write와 무관하게 위반이다. (system path allowlist는 이제 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지한다.)
+> **위험도는 "위치"가 아니라 "효과(effect)"로 판정한다.** AI agent와 그 도구체인(node, npm, git, …)은 자기 런타임·설정·캐시·인증서·node_modules 등 project 밖 파일을 **정상적으로 읽고**, 세션 상태·캐시·로그를 **정상적으로 쓴다**. 따라서 "project 밖"이라는 위치만으로는 위험 신호가 되지 못한다. SysGuard는 다음 순서로 분류한다.
+>
+> 1. **protected(민감) path** — read/write 무관하게 위반 (`UNSAFE`)
+> 2. **persistence/활성화 대상 쓰기** — shell rc, `authorized_keys`, cron, systemd, autostart, git hook, 활성 agent config → `persistence-sensitive-write` (`UNSAFE`). *읽기는 평범하다*: shell은 `.bashrc`를 매번 읽는다.
+> 3. **런타임 bookkeeping 쓰기** — agent 자신의 세션 상태, npm/IDE 캐시·로그, atomic config staging → 정보성(위반 아님)
+> 4. **그 외 project 밖 쓰기** — `outside-project-write` (`REVIEW_NEEDED`)
+> 5. **project 밖 읽기** — 정보성 요약
+>
+> 매칭은 exact / prefix / component 단위로만 하며 `"/.cache/"` 같은 넓은 substring은 쓰지 않는다. home 상대 규칙은 **모니터링 대상 사용자의 home**(리포트 프로세스의 `$HOME`이 아니라 `SUDO_UID`/passwd로 해석)에만 적용되고, 신뢰할 수 없으면 **fail-closed**로 면제를 끈다. flags가 없는 legacy record는 쓰기를 배제할 수 없으므로 절대 면제하지 않는다.
 
 실시간 경고 예시:
 
@@ -150,20 +163,26 @@ config/secrets.json
 
 런타임 프로세스는 repository 밖의 코드·설정·캐시·인증서 저장소·plugin·language toolchain 파일을 정상적으로 읽는다. 따라서 경로 위치만으로는 위험 신호가 되지 못한다. SysGuard는 먼저 protected path를 분류한 뒤, 읽기 전용 open과 mutation(write/create/truncate/append) open을 구분한다.
 
+- protected path 접근: read/write 무관하게 위반 (`UNSAFE`).
+- **persistence/활성화 대상 쓰기**: `persistence-sensitive-write` (`UNSAFE`). 대상은 shell 시작 파일(`.bashrc`·`.profile`·`.zshrc` 등), `~/.ssh/authorized_keys`, cron(`/etc/crontab`·`/etc/cron.d/`·`/var/spool/cron/`), systemd unit(user/system), `~/.config/autostart/`, `~/.config/environment.d/`, `.git/hooks/`, 활성 agent config(`~/.claude.json`·`~/.claude/settings*.json`), `/etc/profile*`, `/etc/ld.so.*`. **읽기는 평범하다** — shell은 `.bashrc`를 매 실행마다 읽는다.
+- **런타임 bookkeeping 쓰기**: 정보성(위반 아님). agent 자신의 세션 상태(`~/.claude/projects|sessions|backups|history.jsonl`), toolchain 캐시·로그(`~/.npm/_cacache|_logs`, `~/.cache/claude-cli-nodejs/`, `~/.config/Code/logs/`), atomic config staging(`~/.claude.json.tmp.<pid>.<hex>`), no-op sink(`/dev/null`·`/dev/tty`), 커널 tracing marker 2종.
+- project 밖 **그 외 write/create**: `outside-project-write` (검토 대상).
 - project 밖 **비민감 읽기**: 정보성(위반 아님). 리포트에 건수와 소량의 sample path만 요약한다.
-- project 밖 **write/create**: `outside-project-write` (검토 대상). 런타임 디렉터리(plugin/cache 등)로의 쓰기도 persistence·변조 위험이 있어 면제하지 않는다.
-- protected path 접근: read/write 무관하게 위반.
-- flags가 없는 legacy record: operation unknown으로 별도 집계하며, 읽기로 단정하지 않는다.
+- flags가 없는 legacy record: operation unknown으로 별도 집계하고 **면제하지 않는다**(쓰기를 배제할 수 없으므로 `REVIEW_NEEDED`).
 
-system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지한다.
+system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지하며, **쓰기에는 적용하지 않는다**(`/usr`·`/etc`·`/opt`에 쓰는 것은 변조 신호).
+
+**알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`(source 가능한 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
 
 ### 7. Commit Safety 평가
 
 | 판정 | 조건 | 권고 |
 |---|---|---|
-| `SAFE` | 위반과 위험 명령이 없음. project 밖 **비민감 읽기**나 단독 network 관찰은 허용된다(정보성) | commit 가능 |
-| `REVIEW_NEEDED` | `outside-project-write`, sandbox 한정 삭제, 다수 파일 변경, build/config 수정, operation-unknown open 등 검토가 필요한 신호 | Git diff·변경 파일과 project 밖 쓰기 검토 |
-| `UNSAFE` | protected path 접근, destructive command, secret exfiltration 의심 중 하나 이상 | commit 보류, credential rotation 및 `git reflog` 확인 |
+| `SAFE` | 정책 위반 없음. project 밖 **비민감 읽기**, 좁게 인정된 **런타임 bookkeeping 쓰기**, 단독 network 관찰은 허용된다(정보성) | commit 가능 |
+| `REVIEW_NEEDED` | `outside-project-write`, operation-unknown open, sandbox 한정 삭제, 다수 파일 변경, build/config 수정 | Git diff·변경 파일과 project 밖 쓰기 검토 |
+| `UNSAFE` | **모든** protected path 접근, `persistence-sensitive-write`, destructive command, world-writable chmod, secret exfiltration 의심 중 하나 이상 | commit 보류, credential rotation 및 `git reflog` 확인 |
+
+> 런타임 면제는 "그 쓰기가 성공했다/무해했다"는 증명이 아니라 **탐지 trade-off**다. 면제된 쓰기도 리포트에 건수와 대표 경로로 항상 남는다.
 
 `.env` 접근이 감지되면 세션은 `UNSAFE`로 승격된다. `.env`의 내용이나 secret value는 JSONL과 HTML report에 저장하지 않고 **접근 사실만** 기록한다.
 
@@ -195,7 +214,7 @@ Report는 다음 순서로 구성된다.
 1. session metadata
 2. Commit Safety badge
 3. normal development activity
-4. outside-project writes (+ 정보성 outside read 요약)
+4. outside-project mutations — ① 검토 대상 outside write ② 런타임 bookkeeping write(정보성) ③ outside read / operation-unknown open 요약. persistence-sensitive write가 있으면 별도 섹션으로 승격 표시
 5. protected path access
 6. dangerous commands
 7. Git status/diff summary
@@ -665,6 +684,8 @@ echo 기반 dangerous command pattern 재현
 | 정상 개발 활동 | real eBPF + normal simulator, 127 events | `SAFE`, violation 0 | 통과 |
 | 위험 행위 | real eBPF + risky simulator, 40 events | `UNSAFE` | 통과: `.env` 2건, `chmod 777`, `rm -rf`, `git reset --hard` 탐지 |
 | 실제 AI agent | real eBPF + Claude Code, 4,548 events | 전체 활동 기록 | 통과: `~/.bashrc` **읽기**는 정보성 outside-read로 요약(위반 아님), 밖으로의 write/create만 `outside-project-write`로 판정 |
+| 실제 AI agent (read-only 작업) | real eBPF + Claude Code, `"read README.md"`만 입력, 3,387 events | `SAFE` | 통과: outside write 35건이 전부 런타임 bookkeeping(agent 세션 상태·npm/VS Code 로그·atomic config staging·`/dev/null`)으로 분류되어 정보성 처리, 위반 0건. 리포트 37 KB |
+| persistence 시나리오 | fake collector, `--home-path` 지정 | `UNSAFE` | 통과: `~/.bashrc`·`/etc/cron.d/`에 대한 **쓰기**는 `persistence-sensitive-write`(critical), 같은 `~/.bashrc`에 대한 **읽기**는 무경보 |
 
 실제 Claude Code session에서도 project 외부 설정, 인증 관련 file, TLS certificate 등 다양한 local resource access가 관측되었다. 이 결과는 Git만으로 확인할 수 없는 agent의 local behavior를 syscall evidence로 가시화할 수 있음을 보여준다.
 

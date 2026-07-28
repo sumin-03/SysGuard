@@ -12,6 +12,11 @@
 struct sysguard_rule_ctx {
     const char *project_path;   // Absolute repo root, or NULL/"" to disable the
                                 // outside-project-write rule.
+    const char *home_path;      // Monitored user's home, for home-relative
+                                // persistence / runtime-noise matching. NULL,
+                                // "", "/" or a relative value disables ONLY the
+                                // home-relative matches (fail-closed: such
+                                // writes then stay outside-project-write).
 };
 
 int rules_evaluate(const struct sysguard_event *ev,

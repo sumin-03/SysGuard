@@ -60,6 +60,16 @@ static struct scenario scenarios[] = {
     {SYSGUARD_EVENT_OPEN, "bash",    "",                 "",                  "/home/user/outside-project/out.log",    3041, 3000, 1000, "", "", (O_WRONLY | O_CREAT), 0}, /* write -> outside-project-write */
     {SYSGUARD_EVENT_OPEN, "claude",  "",                 "",                  "{PROJECT}/Makefile", 3000, 2500, 1000, "", "", 0, 0},
 
+    /* TASK-B-012: outside-project writes classified by EFFECT.
+     * Runtime bookkeeping (the agent writing its own session state / caches) is
+     * informational and must NOT alert, while a write to a persistence or
+     * activation target is critical even though both live outside the project. */
+    {SYSGUARD_EVENT_OPEN, "claude",  "",                 "",                  "{HOME}/.claude/projects/demo.jsonl", 3042, 3000, 1000, "", "", (O_WRONLY | O_CREAT), 0}, /* runtime noise -> no alert */
+    {SYSGUARD_EVENT_OPEN, "node",    "",                 "",                  "{HOME}/.npm/_logs/demo.log",         3043, 3000, 1000, "", "", (O_WRONLY | O_CREAT), 0}, /* runtime noise -> no alert */
+    {SYSGUARD_EVENT_OPEN, "bash",    "",                 "",                  "{HOME}/.bashrc",                     3044, 3000, 1000, "", "", (O_WRONLY | O_APPEND), 0}, /* persistence -> CRITICAL */
+    {SYSGUARD_EVENT_OPEN, "bash",    "",                 "",                  "/etc/cron.d/sysguard-demo",          3045, 3000, 1000, "", "", (O_WRONLY | O_CREAT), 0}, /* persistence -> CRITICAL */
+    {SYSGUARD_EVENT_OPEN, "cat",     "",                 "",                  "{HOME}/.bashrc",                     3046, 3000, 1000, "", "", 0, 0},                    /* READ of the same file -> normal */
+
     /* File mutation events (unlinkat / renameat2 / fchmodat) */
     {SYSGUARD_EVENT_UNLINK, "rm",    "", "", "/home/user/project/build/stale.o", 3030, 3000, 1000, "", "", 0, 0},
     {SYSGUARD_EVENT_RENAME, "mv",    "", "", "",                                 3031, 3000, 1000, "/home/user/project/draft.md", "/home/user/project/final.md", 0, 0},
@@ -96,14 +106,14 @@ static struct connect_scenario connect_scenarios[] = {
 static void fake_emit(FILE *fp, const struct sysguard_event *ev,
                       const struct sysguard_rule_ctx *rctx,
                       const char *session_id, const char *project_path,
-                      const char *target_comm) {
+                      const char *target_comm, const char *home_path) {
     struct sysguard_alert alert;
     if (rules_evaluate(ev, rctx, &alert)) {
         printf("  [%s] %s - %s\n",
                sysguard_severity_string(alert.severity), alert.rule_id, alert.reason);
-        jsonl_write_alert(fp, ev, &alert, session_id, project_path, target_comm);
+        jsonl_write_alert(fp, ev, &alert, session_id, project_path, target_comm, home_path);
     } else {
-        jsonl_write_event(fp, ev, session_id, project_path, target_comm);
+        jsonl_write_event(fp, ev, session_id, project_path, target_comm, home_path);
     }
     usleep(200000);
 }
@@ -111,7 +121,8 @@ static void fake_emit(FILE *fp, const struct sysguard_event *ev,
 void fake_collector_run(const char *output_path,
                         const char *session_id,
                         const char *project_path,
-                        const char *target_comm) {
+                        const char *target_comm,
+                        const char *home_path) {
     FILE *fp = jsonl_open(output_path);
     if (!fp) {
         fprintf(stderr, "[ERROR] Cannot open %s\n", output_path);
@@ -121,7 +132,7 @@ void fake_collector_run(const char *output_path,
     printf("[SysGuard] Fake collector started. Generating %zu events...\n",
            N_SCENARIOS + N_CONNECT);
     uint64_t base_ts = (uint64_t)time(NULL) * 1000000000ULL;
-    struct sysguard_rule_ctx rctx = { project_path };
+    struct sysguard_rule_ctx rctx = { project_path, home_path };
 
     for (size_t i = 0; i < N_SCENARIOS; i++) {
         struct sysguard_event ev = {0};
@@ -132,15 +143,19 @@ void fake_collector_run(const char *output_path,
         ev.uid  = scenarios[i].uid;
         strncpy(ev.comm, scenarios[i].comm, TASK_COMM_LEN - 1);
 
-        /* Expand a leading "{PROJECT}/" sentinel to the runtime project root so
-         * project-local fixtures track --project-path (falling back to a demo
-         * root when none was supplied). */
+        /* Expand a leading "{PROJECT}/" or "{HOME}/" sentinel to the runtime
+         * project root / monitored home so fixtures track --project-path and
+         * --home-path (falling back to demo values when none were supplied). */
         char path_buf[SYSGUARD_MAX_PATH];
         const char *spath = scenarios[i].path;
         if (strncmp(spath, "{PROJECT}/", 10) == 0) {
             const char *root = (project_path && project_path[0])
                                    ? project_path : "/home/user/project";
             snprintf(path_buf, sizeof(path_buf), "%s/%s", root, spath + 10);
+            spath = path_buf;
+        } else if (strncmp(spath, "{HOME}/", 7) == 0) {
+            const char *root = (home_path && home_path[0]) ? home_path : "/home/user";
+            snprintf(path_buf, sizeof(path_buf), "%s/%s", root, spath + 7);
             spath = path_buf;
         }
 
@@ -166,7 +181,7 @@ void fake_collector_run(const char *output_path,
             break;
         }
 
-        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm);
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path);
     }
 
     /* CONNECT events (separate table; payload is a network destination). */
@@ -182,7 +197,7 @@ void fake_collector_run(const char *output_path,
         if (connect_scenarios[i].dest_ip && connect_scenarios[i].dest_ip[0])
             inet_pton(ev.addr_family, connect_scenarios[i].dest_ip, ev.dest_addr);
         ev.dest_port = connect_scenarios[i].dest_port;
-        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm);
+        fake_emit(fp, &ev, &rctx, session_id, project_path, target_comm, home_path);
     }
 
     jsonl_close(fp);

@@ -1,6 +1,7 @@
 """Tests for event formatting and HTML report generation."""
 
 import html
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -133,7 +134,7 @@ class B005ReportConformanceTests(unittest.TestCase):
 
     SECTION_ORDER = [
         "Session Metadata", "Commit Safety:", "Normal Development Activity",
-        "Outside-Project Writes", "Protected Path Access", "Dangerous Commands",
+        "Outside-Project Mutations", "Protected Path Access", "Dangerous Commands",
         "Git Status/Diff Summary", "Alert Details", "Recent Events",
         "Recommended Actions",
     ]
@@ -160,10 +161,10 @@ class B005ReportConformanceTests(unittest.TestCase):
 
     def test_canonical_sections_render_with_empty_state(self):
         rendered = self._render([make_event("openat", path="/project/a")])
-        for heading in ["Outside-Project Writes", "Protected Path Access",
+        for heading in ["Outside-Project Mutations", "Protected Path Access",
                         "Dangerous Commands", "Alert Details", "Recent Events"]:
             self.assertIn(heading, rendered)
-        self.assertIn("No writes outside the project.", rendered)
+        self.assertIn("No review-worthy writes outside the project.", rendered)
         self.assertIn("No alerts or findings.", rendered)
 
     def test_recent_events_renders_every_event_type(self):
@@ -374,7 +375,7 @@ class B010AggregationTests(unittest.TestCase):
         # In Normal Activity the 3 duplicates collapse to a SINGLE escaped row
         # + a safe count (no double-escaping / duplicate rendering there).
         normal = rendered[rendered.index("Normal Development Activity"):
-                          rendered.index("Outside-Project Writes")]
+                          rendered.index("Outside-Project Mutations")]
         self.assertEqual(normal.count(html.escape(hostile)), 1)
         self.assertIn("&times;3", normal)
         self.assertNotIn(hostile, rendered)   # raw markup never appears anywhere
@@ -397,6 +398,49 @@ class B011OutsideProjectReportTests(unittest.TestCase):
         events.append(make_event("openat", path="/home/u/.claude/plugins/p",
                                  flags=os.O_WRONLY, comm="claude"))    # 1 outside write
         rendered = self._render(events)
-        self.assertIn("Outside-Project Writes", rendered)
+        self.assertIn("Outside-Project Mutations", rendered)
         self.assertIn("plugins/p", rendered)                          # write finding rendered
         self.assertIn("Non-sensitive outside-project reads: 5", rendered)
+
+
+class B012MutationSectionTests(unittest.TestCase):
+    """TASK-B-012: the mutations section splits writes by effect."""
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_runtime_noise_and_persistence_sections(self, _git):
+        # The report resolves the monitored home from the session's uid, so build
+        # the fixture paths under the running user's real home.
+        import pwd
+        uid = os.getuid()
+        home = pwd.getpwuid(uid).pw_dir.rstrip("/")
+        noise_path = f"{home}/.claude/projects/s.jsonl"
+        persist_path = f"{home}/.bashrc"
+        with tempfile.TemporaryDirectory() as d:
+            events = [
+                # runtime bookkeeping write (informational)
+                make_event("openat", path=noise_path, project_path="/project",
+                           comm="claude", uid=uid, flags=os.O_WRONLY | os.O_CREAT),
+                # persistence write (UNSAFE)
+                make_event("openat", path=persist_path, project_path="/project",
+                           comm="claude", uid=uid, flags=os.O_WRONLY),
+            ]
+            path = write_jsonl(d, events)
+            out = report.generate_report(path, project_path="/project")
+            rendered = read_text(out)
+
+        self.assertIn("Outside-Project Mutations", rendered)
+        self.assertIn("Runtime bookkeeping writes", rendered)
+        self.assertIn("did not target protected, persistence-sensitive", rendered)
+        self.assertIn("Persistence-Sensitive Writes", rendered)
+        self.assertIn(html.escape(persist_path), rendered)
+        # The noise write must not appear as a review-worthy violation.
+        self.assertIn("No review-worthy writes outside the project.", rendered)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_no_persistence_section_when_absent(self, _git):
+        with tempfile.TemporaryDirectory() as d:
+            path = write_jsonl(d, [make_event("openat", path="/project/a",
+                                              project_path="/project")])
+            out = report.generate_report(path, project_path="/project")
+            rendered = read_text(out)
+        self.assertNotIn("Persistence-Sensitive Writes", rendered)
