@@ -102,7 +102,7 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 
 | Rule ID | 기준 | Severity | 설명 |
 |---|---|---:|---|
-| `outside-project-write` | mutation-capable `openat` | high | project path 밖 파일에 대한 write/create/truncate/append 시도 (런타임 bookkeeping 제외) |
+| `outside-project-write` | mutation-capable `openat` / `renameat2` | medium | project path 밖 파일에 대한 write/create/truncate/append 시도 (런타임 bookkeeping 제외) |
 | `persistence-sensitive-write` | mutation-capable `openat` / `renameat2` | critical | shell 시작 파일, `authorized_keys`, cron, systemd unit, autostart, git hook, 활성 agent config 등 **나중에 코드를 실행·활성화**시키는 대상에 대한 쓰기 |
 | `aws-credentials-access` | `renameat2` destination | critical | `~/.aws/credentials`를 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
 | `secrets-file-access` | `renameat2` destination | high | `config/secrets.json`을 rename으로 교체 (Python `PROTECTED_PATHS`와 parity) |
@@ -113,7 +113,7 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 | `destructive-rm` | `execve` | high | `rm -rf` 실행 |
 | `git-reset-hard` | `execve` | high | `git reset --hard` 실행 |
 | `git-clean-force` | `execve` | high | `git clean -fd` 실행 |
-| `unsafe-chmod` | `execve`, `fchmodat` | medium/high | `chmod 777` 등 위험 권한 변경 |
+| `unsafe-chmod` | `execve`, `fchmodat` | high | `chmod 777` 등 위험 권한 변경 |
 | `downloader-exec` | `execve` | medium | `curl`, `wget` 등 외부 전송 도구 실행 |
 | `file-unlink` | `unlinkat` | medium | 실제 파일 삭제 발생 |
 | `outbound-connect` | `connect` | medium | 외부 network 연결 시도 |
@@ -121,6 +121,8 @@ C engine은 event 단위로 13개 rule을 평가한다. 탐지된 event는 termi
 
 > `renameat2`는 **목적지(destination)** 기준으로 open과 동일한 우선순위(protected → persistence → 일반 outside)를 적용하며, `RENAME_EXCHANGE`는 두 경로를 맞바꾸므로 **양쪽 모두** 목적지로 분류한다. 면제된 runtime 디렉터리에 staging 파일을 만든 뒤 `.env`·credentials·`/tmp/payload`로 rename하는 우회를 막기 위함이고, `aws-credentials-access`/`secrets-file-access`는 그 parity를 위해 C 엔진에 추가되었다(Python은 이미 `PROTECTED_PATHS`로 처리 중).
 
+> **severity 보정.** `outside-project-write`는 protected·persistence·인식된 bookkeeping을 모두 통과한 뒤에야 발화하므로 그 의미는 *"설명되지 않는 밖으로의 쓰기"* 다 — 검토 대상이지 경보가 아니므로 **medium**이다(파일 삭제 `file-unlink`와 같은 등급). 진짜 위험한 형태는 각자 더 높은 등급의 규칙이 담당하며, 밖에 떨어진 payload는 **실행되거나 민감한 대상으로 rename될 때** 그 규칙들이 잡는다. `unsafe-chmod`은 `execve`로 보든 `fchmodat`으로 보든 결과(world-writable)가 같으므로 **관측 경로와 무관하게 high**로 통일한다.
+>
 > **위험도는 "위치"가 아니라 "효과(effect)"로 판정한다.** AI agent와 그 도구체인(node, npm, git, …)은 자기 런타임·설정·캐시·인증서·node_modules 등 project 밖 파일을 **정상적으로 읽고**, 세션 상태·캐시·로그를 **정상적으로 쓴다**. 따라서 "project 밖"이라는 위치만으로는 위험 신호가 되지 못한다. SysGuard는 다음 순서로 분류한다.
 >
 > 1. **protected(민감) path** — read/write 무관하게 위반 (`UNSAFE`)
@@ -195,6 +197,8 @@ sudo ./build/sysguard --agent-mode --target-comm claude \
   --tool-tmp "/tmp/claude-$(id -u)/tool-tmp" \
   --output logs/session.jsonl
 ```
+
+이 기능은 **CLI 전용 opt-in**이다. GUI는 `--tool-tmp`을 넘기지 않으므로 GUI로 시작한 세션에서는 빌드 임시 파일이 `outside-project-write`(medium)로 보고된다 — 사실 그대로의 보고이며, 판정은 `REVIEW_NEEDED`에 머문다. 깨끗한 빌드 세션이 필요하면 위 CLI 절차를 쓴다.
 
 루트는 **절대경로 · 후행 `/` 없음 · `.`/`..` 없음 · 모든 경로 구성요소가 심볼릭 링크가 아님(완전 정규 경로) · 실제 디렉터리(심볼릭 링크 아님) · 모니터링 대상 사용자 소유 · 모드 `0700`** 을 모두 만족해야 하며, 하나라도 어긋나면 경고와 함께 **거부**되어 임시 파일이 다시 검토 대상이 된다(fail-closed). 루트는 JSONL의 `tool_tmp` 필드에 기록되어 리포트가 실시간 엔진과 동일하게 분류한다. `--tool-tmp` 없이 실행하면 빌드 세션은 `outside-project-write`로 보고된다 — 빌드가 project 밖에 쓴 것은 사실이기 때문이다.
 

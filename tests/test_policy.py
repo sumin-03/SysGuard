@@ -844,3 +844,24 @@ class B015ToolTmpTests(unittest.TestCase):
                   "/tmp/claude-c8bd-cwd\n"]:
             with self.subTest(path=p):
                 self.assertFalse(policy.is_runtime_noise_write(p, "/home/u", self.UID))
+
+    def test_outside_write_is_medium_not_high(self):
+        # It fires only after protected / persistence / bookkeeping have been
+        # ruled out, so it means "an unexplained mutation" — review, not alarm.
+        # Same tier as file-unlink; the verdict is unaffected (only `critical`
+        # escalates), so this is a triage-accuracy change.
+        r = self._verdict([self._open("/tmp/unexplained", os.O_WRONLY | os.O_CREAT)])
+        self.assertEqual(r["safety"], "REVIEW_NEEDED")
+        self.assertEqual(len(r["boundary_violations"]), 1)
+        self.assertEqual(r["boundary_violations"][0]["severity"], "medium")
+
+    def test_severity_never_changes_the_verdict_except_critical(self):
+        # A medium/high alert must not escalate on its own; only `critical` does.
+        base = make_event("openat", path="/project/a", project_path="/project",
+                          comm="claude", uid=self.UID, flags=os.O_RDONLY)
+        for sev in ("medium", "high"):
+            with self.subTest(severity=sev):
+                ev = dict(base, alert=True, severity=sev, rule_id="x")
+                self.assertEqual(self._verdict([ev])["safety"], "SAFE")
+        ev = dict(base, alert=True, severity="critical", rule_id="x")
+        self.assertEqual(self._verdict([ev])["safety"], "UNSAFE")

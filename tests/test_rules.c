@@ -259,6 +259,31 @@ int main(void)
     e = mk_open("/dev/null", O_WRONLY);
     CHECK(rule_of_nohome(&e, P) == NULL);
 
+    /* ---- severity calibration ------------------------------------------- */
+    {
+        static struct sysguard_alert a;
+        struct sysguard_rule_ctx c = { P, HOME, TOOLTMP };
+        /* outside-project-write is a review signal, not an alarm. */
+        struct sysguard_event w = mk_open("/tmp/unexplained", O_WRONLY | O_CREAT);
+        CHECK(rules_evaluate(&w, &c, &a) && a.severity == SYSGUARD_SEV_MEDIUM);
+        /* ...while a deletion stays medium too (the tier it always had). */
+        struct sysguard_event u = mk_unlink("/project/docs/x.c", 1000);
+        CHECK(rules_evaluate(&u, &c, &a) && a.severity == SYSGUARD_SEV_MEDIUM);
+        /* unsafe-chmod is high no matter which syscall revealed it. */
+        struct sysguard_event ce;
+        memset(&ce, 0, sizeof(ce));
+        ce.type = SYSGUARD_EVENT_EXEC; ce.pid = 1; ce.uid = 1000;
+        strncpy(ce.comm, "bash", sizeof(ce.comm) - 1);
+        strncpy(ce.argv, "chmod 777 x.sh", sizeof(ce.argv) - 1);
+        CHECK(rules_evaluate(&ce, &c, &a) && a.severity == SYSGUARD_SEV_HIGH);
+        struct sysguard_event cm;
+        memset(&cm, 0, sizeof(cm));
+        cm.type = SYSGUARD_EVENT_CHMOD; cm.pid = 1; cm.uid = 1000; cm.mode = 0777;
+        strncpy(cm.comm, "chmod", sizeof(cm.comm) - 1);
+        strncpy(cm.path, "/project/x.sh", sizeof(cm.path) - 1);
+        CHECK(rules_evaluate(&cm, &c, &a) && a.severity == SYSGUARD_SEV_HIGH);
+    }
+
     /* ---- TASK-B-015: trusted toolchain temp root (--tool-tmp) ------------- */
 
     /* Build intermediates inside the trusted root are informational... */

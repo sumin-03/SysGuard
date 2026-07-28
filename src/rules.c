@@ -494,9 +494,11 @@ int rules_evaluate(const struct sysguard_event *ev,
             return 1;
         }
         if (strstr(ev->argv, "chmod 777") || strstr(ev->argv, "chmod a+rwx")) {
+            /* Same severity as the fchmodat observation below: the risk is the
+             * world-writable result, not which syscall we happened to see. */
             char reason[256];
             snprintf(reason, sizeof(reason), "Unsafe permission change: %s", ev->argv);
-            fill_alert(out, ev, "unsafe-chmod", SYSGUARD_SEV_MEDIUM,
+            fill_alert(out, ev, "unsafe-chmod", SYSGUARD_SEV_HIGH,
                        reason, "Restrict permissions to minimum required.");
             return 1;
         }
@@ -576,7 +578,13 @@ int rules_evaluate(const struct sysguard_event *ev,
         }
 
         /* outside-project-write: an openat that can MUTATE a file outside the
-         * configured project root. Evaluated LAST in the OPEN branch so the
+         * configured project root. MEDIUM, not high: by the time this fires the
+         * target is already known not to be protected, not persistence-bearing
+         * and not recognized bookkeeping, so the finding means "a mutation we
+         * cannot account for" — worth review, not alarming. The genuinely
+         * dangerous shapes have their own higher-severity rules, and a payload
+         * dropped outside only becomes harmful when executed or renamed onto a
+         * sensitive target, which those rules cover. Evaluated LAST in the OPEN branch so the
          * protected-path and persistence rules above win by first-match.
          * Read-only outside-project access (an agent reading its own runtime/
          * config/caches/certs) is routine and NOT flagged — only writes/creates
@@ -594,7 +602,7 @@ int rules_evaluate(const struct sysguard_event *ev,
             snprintf(reason, sizeof(reason),
                      "Write/create outside project boundary: %s (flags 0x%x, project root %s)",
                      ev->path, (unsigned)ev->flags, ctx->project_path);
-            fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_HIGH,
+            fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_MEDIUM,
                        reason, "Verify writes/creates outside the project directory were intended.");
             return 1;
         }
@@ -653,7 +661,7 @@ int rules_evaluate(const struct sysguard_event *ev,
                 snprintf(reason, sizeof(reason),
                          "Rename to a target outside project boundary: %s (project root %s)",
                          dest, ctx->project_path);
-                fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_HIGH,
+                fill_alert(out, ev, "outside-project-write", SYSGUARD_SEV_MEDIUM,
                            reason, "Verify writes/creates outside the project directory were intended.");
                 return 1;
             }

@@ -647,7 +647,7 @@ def classify_event(event: dict, home_path=None, tool_tmp=None) -> dict:
             else:
                 findings.append({
                     "type": "boundary_violation",
-                    "severity": "high",
+                    "severity": "medium",
                     "detail": f"Write/create outside project boundary: {path}",
                 })
 
@@ -694,7 +694,7 @@ def classify_event(event: dict, home_path=None, tool_tmp=None) -> dict:
                 # would bypass the outside-write signal entirely.
                 findings.append({
                     "type": "boundary_violation",
-                    "severity": "high",
+                    "severity": "medium",
                     "detail": f"Rename to a target outside the project: {dest}",
                 })
 
