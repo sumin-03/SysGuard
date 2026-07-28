@@ -165,14 +165,18 @@ config/secrets.json
 
 - protected path 접근: read/write 무관하게 위반 (`UNSAFE`).
 - **persistence/활성화 대상 쓰기**: `persistence-sensitive-write` (`UNSAFE`). 대상은 shell 시작 파일(`.bashrc`·`.profile`·`.zshrc` 등), `~/.ssh/authorized_keys`, cron(`/etc/crontab`·`/etc/cron.d/`·`/var/spool/cron/`), systemd unit(user/system), `~/.config/autostart/`, `~/.config/environment.d/`, `.git/hooks/`, 활성 agent config(`~/.claude.json`·`~/.claude/settings*.json`), `/etc/profile*`, `/etc/ld.so.*`. **읽기는 평범하다** — shell은 `.bashrc`를 매 실행마다 읽는다.
-- **런타임 bookkeeping 쓰기**: 정보성(위반 아님). agent 자신의 세션 상태(`~/.claude/projects|sessions|backups|history.jsonl`), toolchain 캐시·로그(`~/.npm/_cacache|_logs`, `~/.cache/claude-cli-nodejs/`, `~/.config/Code/logs/`), atomic config staging(`~/.claude.json.tmp.<pid>.<hex>`), no-op sink(`/dev/null`·`/dev/tty`), 커널 tracing marker 2종.
+- **런타임 bookkeeping 쓰기**: 정보성(위반 아님). agent 자신의 세션 상태(`~/.claude/projects|sessions|backups|shell-snapshots|history.jsonl`), toolchain 캐시·로그(`~/.npm/_cacache|_logs`, `~/.cache/claude-cli-nodejs/`, `~/.config/Code/logs/`), atomic config staging(`~/.claude.json.tmp.<pid>.<hex>`), agent 임시 작업 영역(`/tmp/claude-<uid>/`, `/tmp/claude-<id>-cwd` — `/tmp` 전체가 아님), no-op sink(`/dev/null`·`/dev/tty`), 커널 tracing marker 2종.
+
+> **`~/.claude` 안이라고 전부 안전한 것은 아니다.** 같은 디렉터리라도 *기록물*(세션 상태·스냅샷·캐시)은 노이즈지만, *설정*인 `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json`은 **hook과 MCP 서버를 정의**하므로 쓰기 시 다음 실행부터 임의 명령이 자동 실행된다. 이 세 파일은 persistence로 분류되어 `UNSAFE`를 유지한다 — prompt injection을 당한 agent가 자기 설정에 backdoor를 심는 것이 이 도구가 잡아야 할 대표적 공격이기 때문이다.
 - project 밖 **그 외 write/create**: `outside-project-write` (검토 대상).
 - project 밖 **비민감 읽기**: 정보성(위반 아님). 리포트에 건수와 소량의 sample path만 요약한다.
 - flags가 없는 legacy record: operation unknown으로 별도 집계하고 **면제하지 않는다**(쓰기를 배제할 수 없으므로 `REVIEW_NEEDED`).
 
 system/tool-config path allowlist는 주요 보안 경계가 아니라 표시·소음 최적화용으로만 유지하며, **쓰기에는 적용하지 않는다**(`/usr`·`/etc`·`/opt`에 쓰는 것은 변조 신호).
 
-**알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`(source 가능한 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
+**심볼릭 링크 — 미해결 한계(정직하게 명시).** 두 엔진 모두 경로를 **lexical**하게 매칭한다. C 엔진은 실시간 hot path라 매 이벤트를 `realpath`할 수 없고, Python은 세션이 끝난 뒤 실행되므로 **이벤트 시점의 링크 상태를 증명할 수 없다.** 따라서 면제 대상처럼 보이는 경로(`/tmp/claude-<uid>/x`든 `~/.claude/projects/x`든)를 민감한 대상으로 링크해두고 쓴 뒤 링크를 지우면, 리포트는 이를 런타임 노이즈로 분류할 수 있다. Python 쪽에 `realpath` 대조를 넣어 **실행 중 남아 있는 링크는 면제를 거부**하지만 이는 defence-in-depth일 뿐 보장이 아니다. 근본 해결은 collector가 **이벤트 시점에 resolve된 대상 경로를 기록**하는 것이며 `TASK-A-014`로 등록했다.
+
+**알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`·`~/.claude/shell-snapshots/`(둘 다 이후 셸에서 source되는 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
 
 ### 7. Commit Safety 평가
 

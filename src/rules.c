@@ -62,6 +62,7 @@ static const char *runtime_noise_home_prefixes[] = {
     ".claude/session-env/", ".claude/plugins/cache/",
     ".npm/_cacache/", ".npm/_logs/",
     ".cache/claude-cli-nodejs/", ".config/Code/logs/",
+    ".claude/shell-snapshots/",
 };
 static const char *runtime_noise_home_exact[] = {
     ".claude/history.jsonl",
@@ -126,6 +127,54 @@ static const char *home_relative(const char *path, const struct sysguard_rule_ct
     if (strncmp(path, ctx->home_path, hlen) != 0) return NULL;
     if (path[hlen] != '/') return NULL;
     return path + hlen + 1;
+}
+
+/* NOTE (documented limitation): this engine matches paths LEXICALLY — it runs in
+ * the real-time hot path and cannot stat/realpath every event. A symlink under
+ * /tmp could therefore make an exempt-looking scratch path resolve elsewhere.
+ * app/policy.py, which owns the user-visible verdict, resolves these paths and
+ * refuses the exemption on any mismatch (`_tmp_path_is_redirected`), so the
+ * reported verdict is not affected. See README §6.
+ *
+ * Agent scratch under /tmp: "/tmp/claude-<uid>/..." or "/tmp/claude-<id>-cwd".
+ * Deliberately NOT all of /tmp — only the writer's OWN run directory (the
+ * numeric component must equal `uid`, so a monitored process cannot hide writes
+ * behind a predictable name like /tmp/claude-9999/) and cwd markers. Mirrors
+ * _TMP_AGENT_*_RE in app/policy.py. */
+static int is_tmp_agent_scratch(const char *path, uint32_t uid) {
+    static const char *pfx = "/tmp/claude-";
+    size_t plen = strlen(pfx);
+    if (strncmp(path, pfx, plen) != 0) return 0;
+    const char *p = path + plen;
+    /* "/tmp/claude-<uid>/" -> the writer's own uid-scoped run directory. The
+     * component is bounded to 10 digits (uid_t is 32-bit) and accumulated in a
+     * 64-bit value, so a crafted over-long number cannot wrap around to match. */
+    const char *d = p;
+    unsigned long long n = 0;
+    int digits = 0;
+    while (*d >= '0' && *d <= '9') {
+        if (++digits > 10) return 0;            /* longer than any uid -> reject */
+        n = n * 10ULL + (unsigned long long)(*d - '0');
+        d++;
+    }
+    if (digits > 0 && *d == '/') {
+        /* Canonical spelling only: "/tmp/claude-00001000/" is an attacker-chosen
+         * directory, not the agent's actual runtime dir, so a leading zero is
+         * rejected rather than compared numerically. uid 0 never qualifies. */
+        if (p[0] == '0') return 0;
+        return n <= 0xFFFFFFFFULL && n == (unsigned long long)uid;
+    }
+    /* "/tmp/claude-<lowercase-hex>-cwd", exact, 4..16 hex digits — deliberately
+     * narrow, since the name alone is not an authenticator (/tmp is
+     * world-writable). Cross-account planting cannot reach this rule: the
+     * collector only emits events from the monitored process subtree, so the
+     * writer is always the agent or its children. A prompt-injected child
+     * writing here is the documented tradeoff class shared with session-env /
+     * shell-snapshots (README §6). */
+    const char *a = p;
+    int hex = 0;
+    while ((*a >= '0' && *a <= '9') || (*a >= 'a' && *a <= 'f')) { a++; hex++; }
+    return hex >= 4 && hex <= 16 && strcmp(a, "-cwd") == 0;
 }
 
 /* .claude.json.tmp.<decimal-pid>.<hex> directly under home (atomic staging). */
@@ -215,11 +264,14 @@ static const char *path_protected_rule(const char *path, enum sysguard_severity 
 }
 
 /* Narrowly recognized agent/toolchain bookkeeping write -> informational. */
-static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ctx *ctx) {
+static int path_is_runtime_noise(const char *path, const struct sysguard_rule_ctx *ctx,
+                                 uint32_t uid) {
     /* Never exempt a path we cannot read literally: traversal defeats prefix
      * matching, so fail closed and let it be reported. */
     if (path_has_dot_segment(path)) return 0;
     if (str_in(path, runtime_noise_abs_exact, ARRAY_LEN(runtime_noise_abs_exact)))
+        return 1;
+    if (is_tmp_agent_scratch(path, uid))
         return 1;
     const char *rel = home_relative(path, ctx);
     if (!rel) return 0;
@@ -454,7 +506,7 @@ int rules_evaluate(const struct sysguard_event *ev,
             ev->path[0] == '/' &&
             open_flags_may_mutate(ev->flags) &&
             !path_is_inside_project(ev->path, ctx->project_path) &&
-            !path_is_runtime_noise(ev->path, ctx)) {
+            !path_is_runtime_noise(ev->path, ctx, ev->uid)) {
             char reason[256];
             snprintf(reason, sizeof(reason),
                      "Write/create outside project boundary: %s (flags 0x%x, project root %s)",

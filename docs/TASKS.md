@@ -45,6 +45,8 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 | TASK-B-008 | P3 | READY | Make git-summary failure behavior match the README's safe-empty contract; test timeout/error paths. |
 | TASK-B-009 | P3 | READY | Surface malformed JSONL-line counts instead of silently discarding corrupt evidence. |
 | TASK-B-010 | P2 | **DONE** | Report-layer aggregation of repeated rows (user-reported: repeated commands/opens bloat the report). Collapse identical alert/normal rows into one `×N` row; display-only, verdict + raw JSONL unchanged. |
+| TASK-A-014 | P2 | READY | Record collector-resolved (symlink-resolved) target paths at event time. Both engines match paths lexically today — C cannot `realpath` in the real-time hot path and Python runs after the session, so a symlink created and removed during the run can make an exempt-looking path (`/tmp/claude-<uid>/x`, `~/.claude/projects/x`, ...) resolve to a persistence target and be classified as runtime noise. Resolving in the collector is the sound fix; the Python `realpath` cross-check is only defence in depth. *Raised by the director during the TASK-B-013 review.* |
+| TASK-B-013 | P2 | **DONE** | Extend the runtime-noise set after a second real session (`"read readme.md"`, 3,788 events) still graded REVIEW_NEEDED on 21 agent bookkeeping writes: `~/.claude/shell-snapshots/` (19) plus agent `/tmp` scratch (2). Adds those to the noise set while keeping `~/.claude/settings*.json` and `~/.claude.json` persistence-sensitive. |
 | TASK-B-012 | P1 | **DONE** | Effect-aware write policy (user-reported: a `"read README.md"` session still graded REVIEW_NEEDED on 35 agent/toolchain bookkeeping writes). Split outside writes into runtime-noise (informational) / ordinary (`REVIEW_NEEDED`) / persistence-activation (`persistence-sensitive-write`, UNSAFE); trusted monitored-home with fail-closed; fixed the protected-verdict leak (AWS creds, sudoers). |
 | TASK-B-011 | P1 | **DONE** | Operation-aware boundary policy redesign (user-reported false-positive storm: a README-only Claude session graded UNSAFE with 1,653 boundary alerts, ~98% read-only). Rename `project-boundary-access` → `outside-project-write`; outside-project **reads** become informational, only **writes/creates** are a boundary violation; verdict drops generic boundary from UNSAFE → REVIEW_NEEDED. C + Python parity, plus a non-sudo C rule harness (`make test-c`). |
 
@@ -53,6 +55,45 @@ prerequisite) · `DEPENDS-ON:<id>` · `IN PROGRESS` · `DONE`.
 ---
 
 ## Completed
+
+### TASK-B-013 — Runtime-noise set extended (shell snapshots, agent /tmp scratch)
+*Completed 2026-07-28.*
+
+**Problem (user-reported):** a second real session (`"read readme.md"`, 3,788
+events) still graded **REVIEW_NEEDED** on 21 outside writes — 19× the same
+`~/.claude/shell-snapshots/snapshot-bash-*.sh` (Claude Code snapshots the shell
+environment on every bash invocation), 1× `/tmp/claude-<uid>/.../tasks/*.output`
+(background-task output), 1× `/tmp/claude-<hex>-cwd` (cwd marker). All agent
+bookkeeping that TASK-B-012's table did not yet cover.
+
+**User's question:** *"should any write inside `~/.claude` count as safe?"*
+**Answer taken:** bookkeeping yes, **configuration no**. `~/.claude/settings.json`,
+`settings.local.json` and `~/.claude.json` define **hooks and MCP servers**, so a
+write there executes arbitrary commands on the next run — a prompt-injected agent
+backdooring its own config is precisely what this tool must catch. Those three
+stay `persistence-sensitive-write` (`UNSAFE`); a regression test pins it.
+
+**Changes:** `.claude/shell-snapshots/` added to the home-relative noise
+prefixes, plus agent `/tmp` scratch (`/tmp/claude-<uid>/`, `/tmp/claude-<hex>-cwd`)
+— never all of `/tmp`. Mirrored in `src/rules.c` and `app/policy.py` with the
+shared parity fixture extended in both harnesses.
+
+**Verification:** clean zero-warning build; `make test-c` all passed; **121
+Python tests OK**; both real sessions now grade **SAFE** (32.2 KB and 36.5 KB
+reports) with 0 review-worthy writes and 75 / 35 informational noise writes.
+
+**Director review:** six passes; every finding applied —
+(1) `/tmp/claude-<N>/` accepted any number → the component must equal the
+writing process's uid; (2) C's unsigned parse could wrap so a huge number
+matched → 10-digit bound plus 64-bit accumulation, mirrored by an identical
+bound in Python (which has bignums); (3) zero-padded spellings
+(`/tmp/claude-00001000/`) still matched → canonical spelling only; (4) the
+`-cwd` marker token was unauthenticated → narrowed to 4–16 lowercase hex;
+(5) symlinked scratch paths could redirect an exempt path onto a persistence
+target → a `realpath` cross-check refuses live redirections, **and** the residual
+gap is documented rather than overclaimed: post-hoc analysis cannot prove
+event-time link state, this affects every lexical exemption (not just `/tmp`),
+and the sound fix is filed as **TASK-A-014** (collector-resolved targets).
 
 ### TASK-B-012 — Effect-aware write policy (runtime noise vs. persistence)
 *Completed 2026-07-28.*

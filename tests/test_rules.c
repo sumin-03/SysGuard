@@ -132,7 +132,9 @@ int main(void)
         HOME "/.npm/_cacache/x", HOME "/.npm/_logs/x.log",
         HOME "/.cache/claude-cli-nodejs/x.jsonl", HOME "/.config/Code/logs/x/cli.log",
         HOME "/.claude.json.tmp.426628.ba9822eb",
+        HOME "/.claude/shell-snapshots/snapshot-bash-123-abc.sh",
         "/dev/null", "/dev/tty", "/sys/kernel/debug/tracing/trace_marker",
+        "/tmp/claude-1000/-home-u-proj/tasks/x.output", "/tmp/claude-c8bd-cwd",
     };
     for (size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++) {
         e = mk_open(noise[i], O_WRONLY | O_CREAT);
@@ -146,6 +148,16 @@ int main(void)
         HOME "/.claude/plugins/evil", HOME "/.claude/x",
         HOME "/.claude.json.tmp.notapid.zz",     /* malformed staging name */
         "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
+        "/tmp/claude-evil/x",        /* not numeric -> no exemption */
+        "/tmp/claude-9999/payload",  /* wrong uid (writer is 1000) -> no exemption */
+        "/tmp/claude-18446744073709552616/x",  /* overflow must not wrap to 1000 */
+        "/tmp/claude-00000000001000/x",        /* over-long padding -> rejected */
+        "/tmp/claude-01000/x",                 /* zero-padded spelling -> rejected */
+        "/tmp/claude-1000",          /* no trailing component -> no exemption */
+        "/tmp/claude-x-cwd/sub",     /* cwd marker is exact-only */
+        "/tmp/claude-evil-cwd",      /* non-hex token -> not the marker shape */
+        "/tmp/claude-abc-cwd",       /* too short (<4 hex) -> not the shape */
+        HOME "/.claude/shell-snapshots",   /* the dir itself, not a file under it */
     };
     for (size_t i = 0; i < sizeof(near_miss) / sizeof(near_miss[0]); i++) {
         e = mk_open(near_miss[i], O_WRONLY | O_CREAT);

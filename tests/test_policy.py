@@ -374,7 +374,10 @@ class B012EffectAwareWriteTests(unittest.TestCase):
 
     HOME = "/home/u"
 
+    UID = 4242
+
     def _open(self, path, flags=os.O_RDONLY, **kw):
+        kw.setdefault("uid", self.UID)
         return make_event("openat", path=path, project_path="/project",
                           comm="claude", flags=flags, **kw)
 
@@ -392,7 +395,9 @@ class B012EffectAwareWriteTests(unittest.TestCase):
             "/home/u/.cache/claude-cli-nodejs/x.jsonl",
             "/home/u/.config/Code/logs/x/cli.log",
             "/home/u/.claude.json.tmp.426628.ba9822eb",
+            "/home/u/.claude/shell-snapshots/snapshot-bash-123-abc.sh",
             "/dev/null", "/dev/tty", "/sys/kernel/debug/tracing/trace_marker",
+            "/tmp/claude-4242/-home-u-proj/tasks/x.output", "/tmp/claude-c8bd-cwd",
         ]:
             with self.subTest(path=p):
                 r = self._verdict([self._open(p, os.O_WRONLY | os.O_CREAT)])
@@ -408,6 +413,11 @@ class B012EffectAwareWriteTests(unittest.TestCase):
             "/home/u/.claude.json.tmp.notapid.zz",
             "/dev/sda", "/proc/sys/kernel/x", "/sys/class/net/x", "/tmp/x",
             "/usr/lib/x.so",
+            "/tmp/claude-evil/x", "/tmp/claude-4242", "/tmp/claude-x-cwd/sub",
+            "/tmp/claude-9999/payload",   # wrong uid -> not the writer's own dir
+            "/tmp/claude-evil-cwd",       # non-hex token -> not the marker shape
+            "/tmp/claude-c8bd-cwd/sub",   # marker is a file, not a directory
+            "/home/u/.claude/shell-snapshots",
         ]:
             with self.subTest(path=p):
                 r = self._verdict([self._open(p, os.O_WRONLY | os.O_CREAT)])
@@ -567,3 +577,67 @@ class B012EffectAwareWriteTests(unittest.TestCase):
                 r = self._verdict([ev])
                 self.assertEqual(r["safety"], "UNSAFE")
                 self.assertEqual(len(r["protected_accesses"]), 1)
+
+    def test_claude_config_writes_stay_unsafe_despite_dot_claude_exemptions(self):
+        # Bookkeeping under ~/.claude is noise, but the SETTINGS files are not:
+        # they can define hooks / MCP servers, i.e. code that runs on the next
+        # session. Exempting all of ~/.claude would hide an agent backdoor.
+        for p in ["/home/u/.claude/settings.json",
+                  "/home/u/.claude/settings.local.json",
+                  "/home/u/.claude.json"]:
+            with self.subTest(path=p):
+                r = self._verdict([self._open(p, os.O_WRONLY)])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["persistence_writes"]), 1)
+                self.assertEqual(r["runtime_noise_writes"], [])
+
+    def test_tmp_scratch_requires_the_writers_own_uid(self):
+        # A predictable numeric directory must not grant an exemption to anyone.
+        own = self._open("/tmp/claude-4242/tasks/x.output", os.O_WRONLY)
+        self.assertEqual(self._verdict([own])["safety"], "SAFE")
+        other = self._open("/tmp/claude-9999/payload", os.O_WRONLY)
+        self.assertEqual(self._verdict([other])["safety"], "REVIEW_NEEDED")
+        # No uid recorded -> fail closed.
+        legacy = self._open("/tmp/claude-4242/tasks/x.output", os.O_WRONLY)
+        legacy.pop("uid")
+        self.assertEqual(self._verdict([legacy])["safety"], "REVIEW_NEEDED")
+
+    def test_tmp_scratch_uid_cannot_be_forged_by_overflow(self):
+        # Mirrors the C bound: an over-long numeric component must never match.
+        for p in ["/tmp/claude-18446744073709556538/x",   # wraps in 64-bit C
+                  "/tmp/claude-00000000004242/x",         # over-long padding
+                  "/tmp/claude-04242/x"]:                 # zero-padded spelling
+            with self.subTest(path=p):
+                self.assertEqual(
+                    self._verdict([self._open(p, os.O_WRONLY)])["safety"],
+                    "REVIEW_NEEDED")
+
+    def test_symlinked_tmp_scratch_loses_its_exemption(self):
+        # /tmp is world-writable and the uid in the NAME authenticates nothing:
+        # linking an exempt-looking scratch path at a persistence target must not
+        # suppress the write.
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            target = pathlib.Path(d) / "bashrc-standin"
+            target.write_text("x")
+            link = pathlib.Path(f"/tmp/claude-{os.getuid()}-symlink-test")
+            real_dir = pathlib.Path(f"/tmp/claude-{os.getuid()}")
+            real_dir.mkdir(exist_ok=True)
+            probe = real_dir / "redirected"
+            try:
+                if probe.is_symlink() or probe.exists():
+                    probe.unlink()
+                probe.symlink_to(target)
+                # Same path shape as the exempt scratch dir, but redirected.
+                self.assertFalse(policy.is_runtime_noise_write(
+                    str(probe), "/home/u", os.getuid()))
+                # A plain (non-symlink) file in the same dir stays exempt.
+                plain = real_dir / "plain-output"
+                plain.write_text("x")
+                self.assertTrue(policy.is_runtime_noise_write(
+                    str(plain), "/home/u", os.getuid()))
+                plain.unlink()
+            finally:
+                if probe.is_symlink():
+                    probe.unlink()
+                link.unlink(missing_ok=True)

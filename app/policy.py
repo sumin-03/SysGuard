@@ -35,6 +35,7 @@ RUNTIME_NOISE_HOME_PREFIXES = (
     ".claude/session-env/", ".claude/plugins/cache/",
     ".npm/_cacache/", ".npm/_logs/",
     ".cache/claude-cli-nodejs/", ".config/Code/logs/",
+    ".claude/shell-snapshots/",
 )
 RUNTIME_NOISE_HOME_EXACT = (".claude/history.jsonl",)
 # No-op sinks and the exact kernel tracing markers (never all of /dev|/proc|/sys).
@@ -43,6 +44,16 @@ RUNTIME_NOISE_ABS_EXACT = (
     "/sys/kernel/debug/tracing/trace_marker",
     "/sys/kernel/tracing/trace_marker",
 )
+# Agent scratch under /tmp. Deliberately NOT all of /tmp (which is arbitrary
+# staging ground): only the agent's own uid-scoped run directory and its cwd
+# marker files. The numeric component must EQUAL the writing process's uid, so
+# "/tmp/claude-9999/payload" written by uid 1000 is not exempt — otherwise any
+# monitored process could hide writes behind a predictable directory name.
+# Writing to /tmp is not itself persistence or credential access: those are
+# caught by their own rules regardless of location, and a staged file renamed
+# onto a protected/persistence target is caught by the rename rule.
+_TMP_AGENT_DIR_RE = re.compile(r"^/tmp/claude-([0-9]+)/")
+_TMP_AGENT_CWD_RE = re.compile(r"^/tmp/claude-[0-9a-f]{4,16}-cwd$")
 # Atomic config staging file directly under home: .claude.json.tmp.<pid>.<hex>.
 _CLAUDE_JSON_TMP_RE = re.compile(r"^\.claude\.json\.tmp\.[0-9]+\.[0-9A-Fa-f]+$")
 
@@ -207,9 +218,29 @@ def _home_rel(path: str, home_path):
     return None
 
 
-def is_runtime_noise_write(path: str, home_path) -> bool:
+def _tmp_path_is_redirected(path: str) -> bool:
+    """Best-effort check that an agent-scratch path under /tmp still resolves to
+    itself; True when a symlink component currently points somewhere else.
+
+    This is DEFENCE IN DEPTH, not a guarantee. The report runs after the session,
+    so a link created and removed during the run resolves to itself here and the
+    exemption is granted. Symlink redirection is a systemic limitation of every
+    lexical exemption in this policy (`~/.claude/projects/x` linked at `~/.bashrc`
+    behaves the same way), not something specific to /tmp — see README §6. The
+    sound fix is to record collector-resolved targets at event time (TASK-A-014).
+    """
+    try:
+        return os.path.realpath(path) != path
+    except (OSError, ValueError):
+        return True    # cannot verify -> fail closed
+
+
+def is_runtime_noise_write(path: str, home_path, uid=None) -> bool:
     """True for a narrowly recognized agent/toolchain bookkeeping write that is
-    informational, not a violation. Never a broad substring match."""
+    informational, not a violation. Never a broad substring match.
+
+    `uid` is the writing process's uid, required to accept its own uid-scoped
+    /tmp run directory; without it that exemption is refused (fail closed)."""
     if not path:
         return False
     # Traversal defeats lexical prefix matching: ".claude/projects/../../.bashrc"
@@ -220,6 +251,23 @@ def is_runtime_noise_write(path: str, home_path) -> bool:
         return False
     if path in RUNTIME_NOISE_ABS_EXACT:
         return True
+    m = _TMP_AGENT_DIR_RE.match(path)
+    if m:
+        # Only the writer's OWN uid-scoped directory, never an arbitrary number.
+        # Canonical spelling only: "/tmp/claude-00001000/" is an attacker-chosen
+        # directory, not the agent's actual runtime dir. Bounded to 10 digits so
+        # the C engine (32-bit uid_t, no bignums) rejects exactly the same set.
+        digits = m.group(1)
+        if len(digits) > 10 or digits.startswith("0"):
+            return False
+        try:
+            if not (uid is not None and int(digits) == int(uid) <= 0xFFFFFFFF):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return not _tmp_path_is_redirected(path)
+    if _TMP_AGENT_CWD_RE.match(path):
+        return not _tmp_path_is_redirected(path)
     rel = _home_rel(path, home_path)
     if rel is None:
         return False
@@ -507,7 +555,7 @@ def classify_event(event: dict, home_path=None) -> dict:
                 "detail": f"Write to persistence/activation target: {path}",
             })
         elif is_boundary_violation(path, project_path, event.get("flags")):
-            if is_runtime_noise_write(path, home_path):
+            if is_runtime_noise_write(path, home_path, event.get("uid")):
                 findings.append({
                     "type": "runtime_noise_write",
                     "severity": "info",
