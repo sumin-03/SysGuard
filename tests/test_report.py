@@ -574,3 +574,80 @@ class B019ReadabilityTests(unittest.TestCase):
         self.assertIn("Commit Safety: UNSAFE", rendered)
         self.assertNotIn("evidence only", rendered)
         self.assertNotIn("do not affect the verdict", rendered)
+
+
+class B021PathTypographyTests(unittest.TestCase):
+    """TASK-B-021: paths are this report's subject matter, so they get their own
+    treatment — and that treatment must never weaken escaping."""
+
+    def test_directory_is_muted_and_basename_emphasised(self):
+        out = report.path_html("File deletion requested: /home/u/proj/docs/hello.c")
+        self.assertIn('<span class="d">/home/u/proj/docs/</span>', out)
+        self.assertIn("<b>hello.c</b>", out)
+
+    def test_non_paths_are_left_alone(self):
+        # "Write/create" and "</script>" are not paths; a single segment after a
+        # word character must not be styled.
+        for text in ["Write/create outside project boundary",
+                     "no path here", "connect 10.0.0.1:443"]:
+            with self.subTest(text=text):
+                self.assertNotIn('class="p"', report.path_html(text))
+
+    def test_escaping_is_unconditional(self):
+        hostile = '<img src=x onerror=alert(1)>'
+        out = report.path_html(f"{hostile} /etc/passwd")
+        self.assertNotIn("<img", out)
+        self.assertIn(html.escape(hostile), out)
+        # A hostile path is escaped inside the styled span too.
+        out2 = report.path_html("/tmp/<script>/x")
+        self.assertNotIn("<script>", out2)
+
+    def test_styles_paths_at_every_boundary_our_messages_use(self):
+        for text in [
+            "Write/create outside project boundary: /tmp/cc1.s",
+            "File deletion requested: /home/u/docs/a.c by rm (pid 30)",
+            "World-writable permission set: /project/a.sh mode 0777",
+            "Write/create outside project boundary: /tmp/x (flags 0x41)",
+        ]:
+            with self.subTest(text=text):
+                self.assertIn('class="p"', report.path_html(text))
+
+    def test_declines_rather_than_mis_splits_an_ambiguous_path(self):
+        # A filename may contain a space; a greedy match would bold "My" as the
+        # basename of "/home/u/My Documents/a.txt". Silence beats being wrong.
+        out = report.path_html("/home/u/My Documents/a.txt was removed")
+        self.assertNotIn('class="p"', out)
+        self.assertIn("My Documents", out)
+
+    def test_unicode_path_components_are_matched(self):
+        out = report.path_html("File deletion requested: /home/u/\ubb38\uc11c/\ubcf4\uace0\uc11c.txt")
+        self.assertIn('class="p"', out)
+
+    def test_empty_input_is_safe(self):
+        self.assertEqual(report.path_html(""), "")
+        self.assertEqual(report.path_html(None), "")
+
+
+class B021ContrastTests(unittest.TestCase):
+    """White text sits on the verdict and severity colours, so they must clear
+    the WCAG AA body-text floor (4.5:1) — the bright brand orange does not."""
+
+    @staticmethod
+    def _ratio(fg, bg):
+        def lum(h):
+            r, g, b = (int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+            f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        a, b = lum(fg), lum(bg)
+        hi, lo = max(a, b), min(a, b)
+        return (hi + 0.05) / (lo + 0.05)
+
+    def test_badge_backgrounds_pass_aa_with_white_text(self):
+        for verdict, color in report.SAFETY_ON_COLORS.items():
+            with self.subTest(verdict=verdict):
+                self.assertGreaterEqual(self._ratio("#ffffff", color), 4.5)
+
+    def test_severity_pills_pass_aa_with_white_text(self):
+        for sev, color in report.SEV_COLORS.items():
+            with self.subTest(severity=sev):
+                self.assertGreaterEqual(self._ratio("#ffffff", color), 4.5)

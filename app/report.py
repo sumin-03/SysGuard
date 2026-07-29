@@ -3,21 +3,31 @@
 
 import json
 import html
+import re
 import sys
 import os
 from policy import evaluate_commit_safety
 from session_analyzer import load_events, filter_target_events, summarize_session
 from git_summary import get_git_summary
 
+# Two roles for the same semantics. The bright values read well as rails,
+# borders and row tints; white text on them does not — #fd7e14 gives 2.57:1,
+# well under the 4.5:1 body-text floor. The "on" values are the same hues with
+# lightness reduced until they pass, so a badge stays recognisable and legible.
 SAFETY_COLORS = {
     "SAFE": "#28a745",
     "REVIEW_NEEDED": "#fd7e14",
     "UNSAFE": "#dc3545",
 }
+SAFETY_ON_COLORS = {
+    "SAFE": "#208738",
+    "REVIEW_NEEDED": "#c05802",
+    "UNSAFE": "#dc3545",
+}
 SEV_COLORS = {
     "critical": "#dc3545",
-    "high": "#e25555",
-    "medium": "#fd7e14",
+    "high": "#dd3535",
+    "medium": "#c05802",
     "low": "#0d6efd",
 }
 
@@ -44,6 +54,44 @@ def aggregate_for_display(items, key_fn):
         else:
             entry[1] += 1
     return [(item, count) for item, count in order]
+
+
+# Absolute paths are the actual content of this report: findings are mostly a
+# verb plus a path. Rendering the directory quietly and the basename firmly lets
+# a reader scan a column of findings by filename instead of re-reading the same
+# long prefix. Matched on the RAW text, then escaped piece by piece.
+# Two or more segments, never directly after a word character (so "Write/create"
+# and "</script>" are left alone), and only when the match ends where one of our
+# own message formats actually ends a path: end of string, or before " by ",
+# " mode ", " -> ", " <-> ", " (", or closing punctuation.
+#
+# The trailing guard is what keeps this honest. A filename may contain a space
+# ("/home/u/My Documents/a.txt"), and a greedy character class would stop at the
+# space and bold "My" as if it were the basename. Rather than guess, an
+# ambiguous match is declined and the text renders plain — styling is a reading
+# aid, so being silent beats being wrong. `\w` is Unicode-aware, so non-ASCII
+# path components are matched normally.
+_PATH_RE = re.compile(
+    r"((?<![\w.])/[\w.\-@+]+(?:/[\w.\-@+]+)+"
+    r"(?=$|\s+by\s|\s+mode\s|\s+<->\s|\s+->\s|\s*\(|[,;)\]\"']))")
+
+
+def path_html(text: str) -> str:
+    """Escape `text`, emphasising the basename of any absolute path in it."""
+    if not text:
+        return ""
+    out = []
+    for i, piece in enumerate(_PATH_RE.split(text)):
+        if i % 2 == 0:
+            out.append(html.escape(piece))
+            continue
+        head, sep, tail = piece.rpartition("/")
+        if head:
+            out.append(f'<span class="p"><span class="d">{html.escape(head + sep)}</span>'
+                       f'<b>{html.escape(tail)}</b></span>')
+        else:
+            out.append(f'<span class="p"><b>{html.escape(piece)}</b></span>')
+    return "".join(out)
 
 
 def _count_suffix(count):
@@ -207,6 +255,7 @@ def generate_report(jsonl_path: str, target_comm: str = "", project_path: str = 
     safety = evaluate_commit_safety(events, project_path, git)
 
     safety_color = SAFETY_COLORS.get(safety["safety"], "#666")
+    safety_on = SAFETY_ON_COLORS.get(safety["safety"], "#555")
     session_id = all_events[0].get("session_id", os.path.basename(jsonl_path)) if all_events else ""
 
     h = f"""<!DOCTYPE html>
@@ -216,64 +265,99 @@ def generate_report(jsonl_path: str, target_comm: str = "", project_path: str = 
 <title>SysGuard Commit Safety Report</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f4f6f9; color: #333; padding: 2rem; }}
-.container {{ max-width: 960px; margin: 0 auto; }}
-h1 {{ color: #1a3a5c; font-size: 1.8rem; margin-bottom: 0.3rem; }}
-.subtitle {{ color: #666; margin-bottom: 1.5rem; }}
-.safety-badge {{ display: inline-block; padding: 0.6rem 1.5rem; border-radius: 8px;
-  color: white; font-size: 1.4rem; font-weight: bold; background: {safety_color}; margin: 0.5rem 0 1rem; }}
-.meta {{ background: white; border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1rem;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.meta td {{ padding: 0.3rem 1rem 0.3rem 0; }}
-.meta .label {{ font-weight: bold; color: #555; white-space: nowrap; }}
-/* Eleven stacked rows pushed the verdict below the fold; the same fields fit in
-   a few lines as a grid, keeping README section 9's ordering intact. */
+
+/* One scale, four steps. The report is a document to be scanned under time
+   pressure, so size changes only where the hierarchy actually changes.
+   Fonts are system stacks: the file is opened over file:// with no network, so
+   a web font would either fail to load or bloat a 36 KB report by embedding. */
+:root {{
+  --ink: #16202c;
+  --ink-soft: #667486;
+  --rule: #e3e8ee;
+  --surface: #ffffff;
+  --canvas: #f2f4f7;
+  --verdict: {safety_color};
+  --verdict-on: {safety_on};
+  --t-display: 1.5rem;
+  --t-section: 1rem;
+  --t-body: 0.875rem;
+  --t-meta: 0.75rem;
+  --sans: system-ui, "DejaVu Sans", "Liberation Sans", Arial, sans-serif;
+  --mono: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
+}}
+body {{ font-family: var(--sans); background: var(--canvas); color: var(--ink);
+  font-size: var(--t-body); line-height: 1.55; padding: 2rem 1.5rem; }}
+.container {{ max-width: 980px; margin: 0 auto; }}
+h1 {{ font-size: var(--t-display); font-weight: 600; letter-spacing: -0.01em; }}
+.subtitle {{ color: var(--ink-soft); font-size: var(--t-meta); margin-bottom: 1.25rem; }}
+
+/* The verdict is the document's state, not just a badge on it. */
+.safety-badge {{ display: inline-block; padding: 0.5rem 1.1rem; border-radius: 6px;
+  color: white; font-size: var(--t-section); font-weight: 600; letter-spacing: 0.01em;
+  background: var(--verdict-on); margin: 0.25rem 0 0.9rem; }}
+.meta {{ background: var(--surface); border-radius: 8px; padding: 1rem 1.25rem;
+  margin-bottom: 1rem; border: 1px solid var(--rule); }}
+.meta .label {{ font-weight: 600; color: var(--ink-soft); white-space: nowrap; }}
 .metagrid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 0.35rem 1.2rem; font-size: 0.86rem; }}
+  gap: 0.2rem 1.5rem; font-size: var(--t-meta); }}
 .metagrid > div {{ display: flex; justify-content: space-between; gap: 0.6rem;
-  border-bottom: 1px dotted #e9ecef; padding: 0.15rem 0; overflow-wrap: anywhere; }}
-.metagrid .label {{ font-weight: bold; color: #555; }}
-.section {{ background: white; border-radius: 8px; padding: 1.2rem 1.5rem; margin-bottom: 1rem;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.section h2 {{ color: #1a3a5c; font-size: 1.1rem; margin-bottom: 0.7rem;
-  border-bottom: 2px solid #e9ecef; padding-bottom: 0.4rem; }}
-.section h3 {{ color: #1a3a5c; font-size: 0.95rem; margin: 0.9rem 0 0.4rem; }}
-.empty {{ color: #888; font-style: italic; }}
-.count {{ color: #888; font-size: 0.82em; font-weight: bold; }}
-ul {{ padding-left: 1.2rem; }}
-li {{ margin-bottom: 0.3rem; }}
-table {{ border-collapse: collapse; width: 100%; margin-top: 0.5rem; }}
-th, td {{ border: 1px solid #dee2e6; padding: 0.45rem 0.7rem; text-align: left; font-size: 0.82rem; }}
-th {{ background: #1a3a5c; color: white; }}
-tr:nth-child(even) {{ background: #f8f9fa; }}
-.sev {{ font-weight: bold; padding: 2px 8px; border-radius: 4px; color: white; font-size: 0.78rem; }}
-pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82rem;
+  border-bottom: 1px solid var(--rule); padding: 0.25rem 0; overflow-wrap: anywhere; }}
+.metagrid .label {{ font-weight: 600; color: var(--ink-soft); }}
+
+.section {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 8px;
+  border-left: 3px solid var(--verdict); padding: 1rem 1.25rem; margin-bottom: 0.75rem; }}
+.section h2 {{ font-size: var(--t-section); font-weight: 600; margin-bottom: 0.6rem;
+  padding-bottom: 0.4rem; border-bottom: 1px solid var(--rule); }}
+.section h3 {{ font-size: var(--t-body); font-weight: 600; color: var(--ink-soft);
+  margin: 0.9rem 0 0.35rem; }}
+.empty {{ color: var(--ink-soft); }}
+.count {{ color: var(--ink-soft); font-size: var(--t-meta); font-weight: 600; }}
+ul {{ padding-left: 1.1rem; }}
+li {{ margin-bottom: 0.25rem; }}
+
+/* Paths are the subject matter: quiet directory, firm basename. */
+.p {{ font-family: var(--mono); font-size: 0.8125rem; overflow-wrap: anywhere; }}
+.p .d {{ color: var(--ink-soft); }}
+.p b {{ font-weight: 600; color: var(--ink); }}
+code {{ font-family: var(--mono); font-size: 0.8125rem; }}
+
+table {{ border-collapse: collapse; width: 100%; margin-top: 0.4rem; }}
+th, td {{ border-bottom: 1px solid var(--rule); padding: 0.4rem 0.6rem; text-align: left;
+  font-size: var(--t-meta); vertical-align: top; }}
+th {{ background: var(--canvas); color: var(--ink-soft); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.6875rem; }}
+.sev {{ font-weight: 600; padding: 1px 7px; border-radius: 3px; color: white;
+  font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+pre {{ background: var(--canvas); border: 1px solid var(--rule); padding: 0.7rem;
+  border-radius: 6px; font-family: var(--mono); font-size: 0.8125rem;
   overflow-x: auto; white-space: pre-wrap; }}
-.footer {{ text-align: center; color: #aaa; font-size: 0.75rem; margin-top: 2rem; }}
+.footer {{ text-align: center; color: var(--ink-soft); font-size: var(--t-meta);
+  margin-top: 1.5rem; }}
 
 /* Verdict summary: why this session got its badge, without scrolling. */
 .summary {{ display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0 0 1rem; }}
-.chip {{ background: white; border-radius: 8px; padding: 0.55rem 0.9rem; min-width: 7.5rem;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid #ced4da; }}
-.chip .n {{ display: block; font-size: 1.35rem; font-weight: bold; color: #1a3a5c; line-height: 1.1; }}
-.chip .k {{ display: block; font-size: 0.72rem; color: #666; text-transform: uppercase;
-  letter-spacing: 0.03em; margin-top: 0.15rem; }}
+.chip {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 8px;
+  padding: 0.5rem 0.85rem; min-width: 7.5rem; border-left: 3px solid var(--rule); }}
+.chip .n {{ display: block; font-size: var(--t-section); font-weight: 600;
+  color: var(--ink); line-height: 1.2; font-variant-numeric: tabular-nums; }}
+.chip .k {{ display: block; font-size: 0.6875rem; color: var(--ink-soft);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-top: 0.1rem; }}
 .chip.hit {{ border-left-color: #dc3545; }}
 .chip.hit .n {{ color: #dc3545; }}
 .chip.review {{ border-left-color: #fd7e14; }}
-.chip.review .n {{ color: #fd7e14; }}
-.chip.info {{ border-left-color: #adb5bd; }}
-.chip.info .n {{ color: #868e96; }}
-.why {{ background: white; border-radius: 8px; padding: 0.7rem 1rem; margin-bottom: 1rem;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid {safety_color}; font-size: 0.9rem; }}
-.why b {{ color: #1a3a5c; }}
-.reason {{ color: #777; font-size: 0.92em; }}
+.chip.review .n {{ color: #c05802; }}
+.chip.info .n {{ color: var(--ink-soft); }}
+.why {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 8px;
+  border-left: 3px solid var(--verdict); padding: 0.6rem 1rem; margin-bottom: 1rem; }}
+.why b {{ color: var(--ink); font-weight: 600; }}
+.reason {{ color: var(--ink-soft); font-size: 0.9em; }}
 
 /* Long, low-signal blocks collapse; <details> keeps the report self-contained
    (no scripting) while letting a reader skip to what matters. */
 details {{ margin-top: 0.3rem; }}
-details > summary {{ cursor: pointer; color: #1a3a5c; font-weight: bold; font-size: 0.9rem;
-  padding: 0.2rem 0; }}
+details > summary {{ cursor: pointer; color: var(--ink-soft); font-weight: 600;
+  font-size: var(--t-meta); padding: 0.2rem 0; }}
+details > summary:focus-visible {{ outline: 2px solid var(--verdict); outline-offset: 2px; }}
 details > summary:hover {{ text-decoration: underline; }}
 thead th {{ position: sticky; top: 0; z-index: 1; }}
 
@@ -282,7 +366,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
   details > div, details > ul, details > table {{ display: block !important; }}
   details[open] > summary::marker, details > summary::marker {{ content: ""; }}
   body {{ padding: 0.5rem; }}
-  .section {{ box-shadow: none; border: 1px solid #dee2e6; page-break-inside: avoid; }}
+  .section {{ border: 1px solid var(--rule); page-break-inside: avoid; }}
 }}
 </style>
 </head>
@@ -328,7 +412,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     if normal_files:
         body = "<ul>\n"
         for f, n in aggregate_for_display(normal_files, lambda s: s)[:20]:
-            body += f"  <li>{html.escape(f)}{_count_suffix(n)}</li>\n"
+            body += f"  <li>{path_html(f)}{_count_suffix(n)}</li>\n"
         body += "</ul>\n"
         h += _details("Files", body, count=len(normal_files))
     # File-mutation evidence that did not raise an alert (renames, safe chmods,
@@ -340,7 +424,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     def _evidence_block(label, rows, collapse):
         body = "<ul>\n"
         for e, n in aggregate_for_display(rows, format_event_detail)[:20]:
-            body += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
+            body += f"  <li>{path_html(format_event_detail(e))}{_count_suffix(n)}</li>\n"
         body += "</ul>\n"
         if collapse:
             return _details(label, body, count=len(rows))
@@ -371,7 +455,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     if safety["boundary_violations"]:
         h += "<ul>\n"
         for f, n in aggregate_for_display(safety["boundary_violations"], lambda x: x["detail"]):
-            h += f'  <li>{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n"
     else:
         h += '<p class="empty">No review-worthy writes outside the project.</p>\n'
@@ -390,7 +474,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
               'ordinary user paths, so they do not affect the verdict.</p>\n')
         h += "<ul>\n"
         for f, n in aggregate_for_display(noise, lambda x: x["detail"])[:20]:
-            h += f'  <li class="empty">{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
+            h += f'  <li class="empty">{path_html(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n"
 
     reads = safety.get("outside_project_reads", 0)
@@ -408,7 +492,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
         if read_paths:
             h += "<ul>\n"
             for p in read_paths[:20]:
-                h += f'  <li class="empty">{html.escape(p)}</li>\n'
+                h += f'  <li class="empty">{path_html(p)}</li>\n'
             h += "</ul>\n"
     h += "</div>\n"
 
@@ -421,7 +505,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
               'a later run. Inspect each target for injected commands.</p>\n')
         h += "<ul>\n"
         for f, n in aggregate_for_display(safety["persistence_writes"], lambda x: x["detail"]):
-            h += f'  <li>{html.escape(f["detail"])}{_count_suffix(n)}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n</div>\n"
 
     # 5. Protected Path Access — always rendered.
@@ -429,7 +513,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     if safety["protected_accesses"]:
         h += "<ul>\n"
         for f in safety["protected_accesses"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}</li>\n'
         h += "</ul>\n"
     else:
         h += '<p class="empty">No protected path access.</p>\n'
@@ -440,7 +524,7 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     if safety["dangerous_commands"]:
         h += "<ul>\n"
         for f in safety["dangerous_commands"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}</li>\n'
         h += "</ul>\n"
     else:
         h += '<p class="empty">No dangerous commands.</p>\n'
@@ -484,8 +568,8 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
                 # squeezed the path it was explaining. It still carries detail
                 # the other cells lack (octal modes, sequence wording), so it is
                 # kept as a muted second line.
-                detail = html.escape(format_event_detail(a))
-                reason = html.escape(a.get("reason", ""))
+                detail = path_html(format_event_detail(a))
+                reason = path_html(a.get("reason", ""))
                 cell = detail or "&mdash;"
                 if reason and reason != detail:
                     cell += f'<br><span class="reason">{reason}</span>'
@@ -532,17 +616,17 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
     if safety.get("unsafe_permission_changes"):
         h += '<h3>&#128275; Unsafe Permission Changes</h3><ul>\n'
         for f in safety["unsafe_permission_changes"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}</li>\n'
         h += "</ul>\n"
     if safety.get("file_deletions"):
         h += '<h3>&#128465;&#65039; File Deletions</h3><ul>\n'
         for f in safety["file_deletions"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}</li>\n'
         h += "</ul>\n"
     if safety.get("review_findings"):
         h += '<h3>&#128269; Review Needed</h3><ul>\n'
         for f in safety["review_findings"]:
-            h += f'  <li>{html.escape(f["detail"])}</li>\n'
+            h += f'  <li>{path_html(f["detail"])}</li>\n'
         h += "</ul>\n"
     if not has_findings:
         h += '<p class="empty">No alerts or findings.</p>\n'
