@@ -917,6 +917,29 @@ class B022AgentConfigRestageTests(unittest.TestCase):
         r = self._verdict([self._rename("/home/u/.bashrc.tmp.42.ab", "/home/u/.bashrc")])
         self.assertEqual(r["safety"], "UNSAFE")
 
+    def test_plugin_registry_migration_is_informational(self):
+        # Every observed session renames installed_plugins_v2.json onto
+        # installed_plugins.json — a schema migration, not a staged write.
+        reg = "/home/u/.claude/plugins/installed_plugins.json"
+        r = self._verdict([self._rename("/home/u/.claude/plugins/installed_plugins_v2.json", reg)])
+        self.assertEqual(r["safety"], "SAFE")
+        self.assertEqual(len(r["agent_config_changes"]), 1)
+
+    def test_plugin_registry_accepts_only_its_own_siblings(self):
+        reg = "/home/u/.claude/plugins/installed_plugins.json"
+        for old in ["/home/u/evil.json",
+                    "/home/u/x/installed_plugins_v2.json",
+                    "/home/u/.claude/plugins/other.json"]:
+            with self.subTest(old=old):
+                r = self._verdict([self._rename(old, reg)])
+                self.assertEqual(r["safety"], "UNSAFE")
+
+    def test_direct_write_to_plugin_registry_escalates(self):
+        r = self._verdict([self._open("/home/u/.claude/plugins/installed_plugins.json",
+                                     os.O_WRONLY | os.O_TRUNC)])
+        self.assertEqual(r["safety"], "UNSAFE")
+        self.assertEqual(len(r["persistence_writes"]), 1)
+
     def test_only_the_owning_agent_may_restage_the_config(self):
         stage, cfg = "/home/u/.claude.json.tmp.42.ab", "/home/u/.claude.json"
         for comm, expect_safe in [("claude", True), ("Bun Pool 3", True),

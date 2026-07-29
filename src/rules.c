@@ -92,6 +92,9 @@ static const char *persist_home_exact[] = {
     ".zshrc", ".zprofile", ".zlogin", ".zshenv",
     ".gitconfig", ".config/git/config",
     ".claude.json", ".claude/settings.json", ".claude/settings.local.json",
+    /* The plugin registry decides which plugins load, so a direct write is
+     * activation-bearing; only the agent's own migration rename is exempt. */
+    ".claude/plugins/installed_plugins.json",
     ".ssh/authorized_keys", ".ssh/authorized_keys2",
 };
 static const char *persist_home_prefixes[] = {
@@ -374,7 +377,32 @@ static int path_is_runtime_noise_deletion(const char *path,
  * name, still fires. Mirrors AGENT_CONFIG_HOME_PATHS in app/policy.py. */
 static const char *agent_config_home_paths[] = {
     ".claude.json", ".claude/settings.json", ".claude/settings.local.json",
+    ".claude/plugins/installed_plugins.json",
 };
+/* The plugin registry is migrated between schema versions rather than staged:
+ * every observed session renames "installed_plugins_v2.json" onto
+ * "installed_plugins.json". Accept a version-suffixed SIBLING as the source for
+ * that one destination, and nothing else. */
+#define PLUGIN_REGISTRY_REL ".claude/plugins/installed_plugins.json"
+
+static int is_plugin_registry_sibling(const char *old_path, const char *new_path) {
+    const char *o = strrchr(old_path, '/');
+    const char *n = strrchr(new_path, '/');
+    if (!o || !n) return 0;
+    if ((size_t)(o - old_path) != (size_t)(n - new_path)) return 0;   /* same dir */
+    if (strncmp(old_path, new_path, (size_t)(o - old_path)) != 0) return 0;
+    static const char *base = "installed_plugins";
+    size_t blen = strlen(base);
+    const char *name = o + 1;
+    if (strncmp(name, base, blen) != 0) return 0;
+    const char *p = name + blen;
+    if (*p == '_' && p[1] == 'v') {          /* optional _v<N> */
+        p += 2;
+        if (!(*p >= '0' && *p <= '9')) return 0;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    return strcmp(p, ".json") == 0;
+}
 
 static int path_is_agent_config(const char *path, const struct sysguard_rule_ctx *ctx) {
     const char *rel = home_relative(path, ctx);
@@ -403,7 +431,13 @@ static int is_agent_config_restage(const char *old_path, const char *new_path,
     if (!old_path || !new_path || !path_is_agent_config(new_path, ctx)) return 0;
     if (path_has_dot_segment(old_path) || path_has_dot_segment(new_path)) return 0;
     size_t nlen = strlen(new_path);
-    if (strncmp(old_path, new_path, nlen) != 0) return 0;
+    if (strncmp(old_path, new_path, nlen) != 0) {
+        /* Not a "<dest>.tmp..." name; the only other accepted shape is the
+         * plugin registry's version-suffixed sibling. */
+        const char *rel = home_relative(new_path, ctx);
+        return rel && strcmp(rel, PLUGIN_REGISTRY_REL) == 0 &&
+               is_plugin_registry_sibling(old_path, new_path);
+    }
     const char *suffix = old_path + nlen;
     static const char *pfx = ".tmp.";
     size_t plen = strlen(pfx);

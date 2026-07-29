@@ -231,6 +231,25 @@ int main(void)
     e = mk_rename(HOME "/.claude/settings.json.tmp.42.beef", HOME "/.claude/settings.json");
     CHECK(rule_of(&e, P) == NULL);
 
+    /* Plugin registry: the agent migrates it between schema versions with a
+     * sibling rename, which is how it always changes. */
+    e = mk_rename(HOME "/.claude/plugins/installed_plugins_v2.json",
+                  HOME "/.claude/plugins/installed_plugins.json");
+    CHECK(rule_of(&e, P) == NULL);
+    /* ...but not from an arbitrary source, another directory, or another agent. */
+    e = mk_rename(HOME "/evil.json", HOME "/.claude/plugins/installed_plugins.json");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/x/installed_plugins_v2.json",
+                  HOME "/.claude/plugins/installed_plugins.json");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/.claude/plugins/installed_plugins_v2.json",
+                  HOME "/.claude/plugins/installed_plugins.json");
+    strncpy(e.comm, "codex", sizeof(e.comm) - 1);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    /* A DIRECT write to the registry is activation-bearing. */
+    e = mk_open(HOME "/.claude/plugins/installed_plugins.json", O_WRONLY | O_TRUNC);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+
     /* Only the owning agent may use this rule: another monitored agent staging
      * the same name and renaming it into place is tampering, not bookkeeping. */
     e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");

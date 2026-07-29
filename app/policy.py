@@ -89,6 +89,10 @@ PERSIST_HOME_EXACT = (
     ".zshrc", ".zprofile", ".zlogin", ".zshenv",
     ".gitconfig", ".config/git/config",
     ".claude.json", ".claude/settings.json", ".claude/settings.local.json",
+    # The plugin registry decides which plugins load, so a direct write to it is
+    # activation-bearing just like settings.json. Only the agent's own schema
+    # migration (a version-suffixed sibling rename) is informational.
+    ".claude/plugins/installed_plugins.json",
     ".ssh/authorized_keys", ".ssh/authorized_keys2",
 )
 PERSIST_HOME_PREFIXES = (
@@ -388,7 +392,15 @@ AGENT_CONFIG_HOME_PATHS = (
     ".claude.json",
     ".claude/settings.json",
     ".claude/settings.local.json",
+    ".claude/plugins/installed_plugins.json",
 )
+# The plugin registry is migrated between schema versions rather than staged:
+# every observed session renames "installed_plugins_v2.json" onto
+# "installed_plugins.json". Accept a SIBLING registry file as the source for that
+# one destination — same directory, same base name, version-suffixed — and
+# nothing else.
+_PLUGIN_REGISTRY = ".claude/plugins/installed_plugins.json"
+_PLUGIN_MIGRATION_RE = re.compile(r"installed_plugins(_v[0-9]+)?\.json\Z")
 # "<config>.tmp.<pid>.<hex>" — the staging name must belong to the destination it
 # replaces, so an arbitrary file cannot be renamed into place under this rule.
 _STAGING_SUFFIX_RE = re.compile(r"\.tmp\.[0-9]+\.[0-9A-Fa-f]+\Z")
@@ -430,7 +442,15 @@ def is_agent_config_restage(old_path: str, new_path: str, home_path,
         return False
     if _has_dot_segment(old_path) or _has_dot_segment(new_path):
         return False
-    return _STAGING_SUFFIX_RE.sub("", old_path) == new_path
+    if _STAGING_SUFFIX_RE.sub("", old_path) == new_path:
+        return True
+    # Plugin-registry schema migration: same directory, a version-suffixed
+    # sibling of the destination.
+    if _home_rel(new_path, home_path) == _PLUGIN_REGISTRY:
+        old_dir, _, old_name = old_path.rpartition("/")
+        new_dir, _, _ = new_path.rpartition("/")
+        return bool(old_dir == new_dir and _PLUGIN_MIGRATION_RE.fullmatch(old_name))
+    return False
 
 
 def is_persistence_sensitive(path: str, home_path) -> bool:
