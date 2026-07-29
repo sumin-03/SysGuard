@@ -52,7 +52,9 @@ class ReportGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = report.generate_report(write_jsonl(directory, events), project_path="/project")
             rendered = read_text(output)
-        for heading in ["File Deletions", "Unsafe Permission Changes", "Process exits:"]:
+        # "Process exits" is now a collapsed <details> summary (lifecycle
+        # bookkeeping), so it no longer carries the "<b>label:</b>" colon.
+        for heading in ["File Deletions", "Unsafe Permission Changes", "Process exits"]:
             with self.subTest(heading=heading):
                 self.assertIn(heading, rendered)
 
@@ -294,8 +296,8 @@ class B010AggregationTests(unittest.TestCase):
         rendered = self._render([self._alert() for _ in range(20)])
         self.assertIn("&times;20", rendered)                    # aggregated marker
         self.assertEqual(rendered.count("downloader-exec"), 1)  # one alert row
-        self.assertIn("Total Events</td><td>20</td>", rendered)  # raw metadata kept
-        self.assertIn("Alerts</td><td>20</td>", rendered)
+        self.assertIn(">Total Events</span>20</div>", rendered)  # raw metadata kept
+        self.assertIn(">Alerts</span>20</div>", rendered)
 
     def test_distinct_alerts_stay_separate(self):
         events = [
@@ -308,7 +310,9 @@ class B010AggregationTests(unittest.TestCase):
         # Count within the Alert Details section only (Recent Events is a raw,
         # unaggregated tail and also shows these events).
         alert_region = rendered[rendered.index("Alert Details"):rendered.index("Recent Events")]
-        self.assertEqual(alert_region.count("<td>rm -rf a</td>"), 3)  # not merged (comm/pid differ)
+        # The target cell now carries the reason as a second line, so count the
+        # target itself rather than an exact cell string.
+        self.assertEqual(alert_region.count("rm -rf a<br>"), 3)  # not merged (comm/pid differ)
         self.assertIn("git-reset-hard", rendered)
         self.assertNotIn("&times;", alert_region)                # all distinct -> no counts
 
@@ -365,8 +369,8 @@ class B010AggregationTests(unittest.TestCase):
                         side_effect=lambda items, key_fn: [(i, 1) for i in items]):
             noagg = self._render(events)
         self.assertEqual(badge(agg), badge(noagg))               # verdict badge identical
-        self.assertIn("Total Events</td><td>15</td>", agg)
-        self.assertIn("Total Events</td><td>15</td>", noagg)
+        self.assertIn(">Total Events</span>15</div>", agg)
+        self.assertIn(">Total Events</span>15</div>", noagg)
 
     # --- escaping ---
     def test_repeated_hostile_value_escaped_once_with_count(self):
@@ -458,3 +462,115 @@ class B012MutationSectionTests(unittest.TestCase):
         self.assertIn("scratch deletion", rendered)
         self.assertIn(html.escape(scratch), rendered)
         self.assertNotIn("File Deletions", rendered)
+
+
+class B019ReadabilityTests(unittest.TestCase):
+    """TASK-B-019: the verdict must be explainable without scrolling, and the
+    bulky low-signal blocks must not bury the findings."""
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_summary_chips_and_reason_appear_before_the_sections(self, _git):
+        events = [
+            make_event("openat", path="/tmp/x", project_path="/project",
+                       comm="claude", uid=os.getuid(), flags=os.O_WRONLY | os.O_CREAT),
+            make_event("unlinkat", path="/project/a.c", project_path="/project",
+                       comm="rm", uid=os.getuid()),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, events), project_path="/project"))
+
+        self.assertIn('class="summary"', rendered)
+        self.assertIn("Why this verdict:", rendered)
+        self.assertIn("outside-project write", rendered)
+        self.assertIn("file deletion", rendered)
+        # The explanation must precede the detail sections it summarizes.
+        self.assertLess(rendered.index("Why this verdict:"),
+                        rendered.index("Outside-Project Mutations"))
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_clean_session_says_so_instead_of_listing_nothing(self, _git):
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, [make_event("openat", path="/project/a",
+                                           project_path="/project")]),
+                project_path="/project"))
+        self.assertIn("no policy findings", rendered)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_network_evidence_is_split_out_and_collapsed(self, _git):
+        # Dozens of connects per run visually swamped the findings that actually
+        # drive the verdict, so they get their own collapsed block.
+        events = [make_event("connect", path="", project_path="/project",
+                             comm="curl", alert=True, severity="medium",
+                             rule_id="outbound-connect", reason="conn",
+                             dest_addr=f"10.0.0.{i}", dest_port=443)
+                  for i in range(3)]
+        events.append(make_event("execve", argv="rm -rf x", project_path="/project",
+                                 comm="bash", alert=True, severity="high",
+                                 rule_id="destructive-rm", reason="danger"))
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, events), project_path="/project"))
+        self.assertIn("Outbound connections (evidence only)", rendered)
+        alert_region = rendered[rendered.index("Alert Details"):]
+        # The real finding is rendered before the collapsed evidence block.
+        self.assertLess(alert_region.index("destructive-rm"),
+                        alert_region.index("Outbound connections"))
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_print_stylesheet_expands_collapsed_blocks(self, _git):
+        # A PDF/print copy must not hide evidence behind a closed <details>.
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, [make_event("exit_group", pid=2, comm="codex",
+                                           project_path="/project")]),
+                project_path="/project"))
+        self.assertIn("@media print", rendered)
+        self.assertIn("display: block !important", rendered)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_unmatched_critical_alert_is_still_explained(self, _git):
+        # A critical alert forces UNSAFE on its own; the summary must not claim
+        # there were no findings.
+        ev = make_event("openat", path="/project/a", project_path="/project",
+                        comm="x", alert=True, severity="critical",
+                        rule_id="future-rule", reason="r")
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, [ev]), project_path="/project"))
+        self.assertIn("Commit Safety: UNSAFE", rendered)
+        self.assertIn("critical alert", rendered)
+        self.assertNotIn("no policy findings", rendered)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_critical_is_listed_even_when_review_findings_exist(self, _git):
+        # Otherwise an UNSAFE badge could be explained by a deletion alone,
+        # which on its own would only be REVIEW_NEEDED.
+        events = [
+            make_event("openat", path="/project/a", project_path="/project",
+                       comm="x", alert=True, severity="critical",
+                       rule_id="future-rule", reason="r"),
+            make_event("unlinkat", path="/project/b.c", project_path="/project",
+                       comm="rm"),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, events), project_path="/project"))
+        why = rendered[rendered.index("Why this verdict:"):][:200]
+        self.assertIn("critical alert", why)
+        self.assertIn("file deletion", why)
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_critical_outbound_is_a_finding_not_evidence(self, _git):
+        # A critical outbound alert drives UNSAFE, so it must not be filed under
+        # "evidence only" where the report says it does not affect the verdict.
+        ev = make_event("connect", path="", project_path="/project", comm="curl",
+                        alert=True, severity="critical", rule_id="outbound-connect",
+                        reason="exfil", dest_addr="10.0.0.1", dest_port=443)
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, [ev]), project_path="/project"))
+        self.assertIn("Commit Safety: UNSAFE", rendered)
+        self.assertNotIn("evidence only", rendered)
+        self.assertNotIn("do not affect the verdict", rendered)

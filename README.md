@@ -246,7 +246,7 @@ SysGuard : repository 외부에서 어떤 local action이 발생했는가?
 Report는 다음 순서로 구성된다.
 
 1. session metadata
-2. Commit Safety badge
+2. Commit Safety badge — 뒤이어 **판정 요약 스트립**(항목별 건수 chip)과 *"Why this verdict"* 한 줄이 붙어, 스크롤 없이 판정 근거를 읽을 수 있다
 3. normal development activity
 4. outside-project mutations — ① 검토 대상 outside write ② 런타임 bookkeeping write(정보성) ③ outside read / operation-unknown open 요약. persistence-sensitive write가 있으면 별도 섹션으로 승격 표시
 5. protected path access
@@ -255,6 +255,8 @@ Report는 다음 순서로 구성된다.
 8. alert details
 9. recent events
 10. recommended actions
+
+> **가독성 규칙.** 분량이 크고 신호가 약한 블록(정상 명령·파일 목록, process exit, event log, 정보성 outbound connection)은 `<details>`로 **기본 접힘** 상태다. 스크립트 없이 HTML 기본 요소만 쓰므로 리포트는 여전히 단일 자체완결 파일이며, `@media print` 규칙이 인쇄·PDF 시 모두 펼친다. 반대로 판정을 좌우하는 항목(위반·삭제·권고)은 항상 펼쳐져 있다. alert 표의 `reason`은 별도 컬럼 대신 대상 경로 아래 보조 줄로 들어가 가로 폭을 확보한다.
 
 판정 badge:
 

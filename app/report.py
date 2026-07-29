@@ -94,6 +94,100 @@ def format_event_detail(ev: dict) -> str:
     return ev.get("path", "") or ev.get("argv", "") or etype
 
 
+def build_summary(safety, events=None):
+    """Chips + a one-line explanation of the verdict.
+
+    Returns RAW text pieces; the caller escapes. The chips mirror the policy
+    buckets so a reader can see WHY the badge says what it says without
+    scrolling through nine sections. Counts come straight from the verdict
+    result — this is presentation only and cannot change the verdict.
+    """
+    chips = [
+        ("Protected", len(safety.get("protected_accesses", [])), "hit"),
+        ("Persistence", len(safety.get("persistence_writes", [])), "hit"),
+        ("Dangerous cmd", len(safety.get("dangerous_commands", [])), "hit"),
+        ("Outside writes", len(safety.get("boundary_violations", [])), "review"),
+        ("Deletions", len(safety.get("file_deletions", [])), "review"),
+        ("Outside reads", safety.get("outside_project_reads", 0), "info"),
+        ("Runtime noise", len(safety.get("runtime_noise_writes", []))
+                          + len(safety.get("runtime_noise_deletions", [])), "info"),
+    ]
+
+    # The verdict's actual drivers, in the same precedence the policy uses.
+    # Tracked in two groups so an UNSAFE badge is never explained by
+    # review-level reasons alone.
+    unsafe_drivers = []
+    for label, items in (("protected path access", safety.get("protected_accesses")),
+                         ("persistence/activation write", safety.get("persistence_writes")),
+                         ("dangerous command", safety.get("dangerous_commands")),
+                         ("world-writable chmod", safety.get("unsafe_permission_changes")),
+                         ("secret-exfiltration sequence", safety.get("suspicious_sequences"))):
+        if items:
+            unsafe_drivers.append(f"{label} \u00d7{len(items)}")
+
+    # A critical alert forces UNSAFE on its own, even when it maps to none of the
+    # buckets above (a new collector rule, say). Report it whenever nothing else
+    # accounts for the UNSAFE badge — otherwise the summary could list only a
+    # review-level reason under an UNSAFE verdict.
+    if not unsafe_drivers and events:
+        critical = sum(1 for e in events
+                       if e.get("alert") and e.get("severity") == "critical")
+        if critical:
+            unsafe_drivers.append(f"critical alert \u00d7{critical}")
+
+    review_drivers = []
+    for label, items in (("outside-project write", safety.get("boundary_violations")),
+                         ("file deletion", safety.get("file_deletions"))):
+        if items:
+            review_drivers.append(f"{label} \u00d7{len(items)}")
+    unknown = safety.get("outside_project_unknown_opens", 0)
+    if unknown:
+        review_drivers.append(f"operation-unknown open \u00d7{unknown}")
+    for rf in safety.get("review_findings", []):
+        review_drivers.append(rf.get("type", "").replace("_", " "))
+
+    drivers = unsafe_drivers + review_drivers
+
+    return chips, drivers
+
+
+def _details(summary_text, body, count=None, open_by_default=False):
+    """Wrap a long, low-signal block in a collapsed <details>.
+
+    Uses the native element so the report stays a single self-contained file
+    with no scripting; @media print force-expands it for PDF export.
+    """
+    label = html.escape(summary_text)
+    if count is not None:
+        label += f' <span class="count">({count})</span>'
+    attr = " open" if open_by_default else ""
+    return f"<details{attr}><summary>{label}</summary>\n{body}</details>\n"
+
+
+def _summary_html(safety, events=None):
+    """Render the summary strip. All text here is internally derived, except the
+    verdict name which is escaped by the caller's template."""
+    chips, drivers = build_summary(safety, events)
+    out = ['<div class="summary">']
+    for label, count, kind in chips:
+        cls = kind if count else "info"
+        out.append(f'<div class="chip {cls}"><span class="n">{count:,}</span>'
+                   f'<span class="k">{html.escape(label)}</span></div>')
+    out.append("</div>")
+    if drivers:
+        out.append('<div class="why"><b>Why this verdict:</b> '
+                   + html.escape(", ".join(drivers)) + "</div>")
+    elif safety.get("safety") == "SAFE":
+        out.append('<div class="why"><b>Why this verdict:</b> no policy findings; '
+                   'outside-project reads and runtime bookkeeping are informational.</div>')
+    else:
+        # Never claim "no findings" under a non-SAFE badge.
+        out.append('<div class="why"><b>Why this verdict:</b> see the sections '
+                   'below \u2014 the badge was set by a condition not summarized '
+                   'here.</div>')
+    return "\n".join(out)
+
+
 def generate_report(jsonl_path: str, target_comm: str = "", project_path: str = "") -> str:
     html_path = jsonl_path.replace(".jsonl", ".html")
 
@@ -132,6 +226,13 @@ h1 {{ color: #1a3a5c; font-size: 1.8rem; margin-bottom: 0.3rem; }}
   box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
 .meta td {{ padding: 0.3rem 1rem 0.3rem 0; }}
 .meta .label {{ font-weight: bold; color: #555; white-space: nowrap; }}
+/* Eleven stacked rows pushed the verdict below the fold; the same fields fit in
+   a few lines as a grid, keeping README section 9's ordering intact. */
+.metagrid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0.35rem 1.2rem; font-size: 0.86rem; }}
+.metagrid > div {{ display: flex; justify-content: space-between; gap: 0.6rem;
+  border-bottom: 1px dotted #e9ecef; padding: 0.15rem 0; overflow-wrap: anywhere; }}
+.metagrid .label {{ font-weight: bold; color: #555; }}
 .section {{ background: white; border-radius: 8px; padding: 1.2rem 1.5rem; margin-bottom: 1rem;
   box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
 .section h2 {{ color: #1a3a5c; font-size: 1.1rem; margin-bottom: 0.7rem;
@@ -149,6 +250,40 @@ tr:nth-child(even) {{ background: #f8f9fa; }}
 pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82rem;
   overflow-x: auto; white-space: pre-wrap; }}
 .footer {{ text-align: center; color: #aaa; font-size: 0.75rem; margin-top: 2rem; }}
+
+/* Verdict summary: why this session got its badge, without scrolling. */
+.summary {{ display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0 0 1rem; }}
+.chip {{ background: white; border-radius: 8px; padding: 0.55rem 0.9rem; min-width: 7.5rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid #ced4da; }}
+.chip .n {{ display: block; font-size: 1.35rem; font-weight: bold; color: #1a3a5c; line-height: 1.1; }}
+.chip .k {{ display: block; font-size: 0.72rem; color: #666; text-transform: uppercase;
+  letter-spacing: 0.03em; margin-top: 0.15rem; }}
+.chip.hit {{ border-left-color: #dc3545; }}
+.chip.hit .n {{ color: #dc3545; }}
+.chip.review {{ border-left-color: #fd7e14; }}
+.chip.review .n {{ color: #fd7e14; }}
+.chip.info {{ border-left-color: #adb5bd; }}
+.chip.info .n {{ color: #868e96; }}
+.why {{ background: white; border-radius: 8px; padding: 0.7rem 1rem; margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid {safety_color}; font-size: 0.9rem; }}
+.why b {{ color: #1a3a5c; }}
+.reason {{ color: #777; font-size: 0.92em; }}
+
+/* Long, low-signal blocks collapse; <details> keeps the report self-contained
+   (no scripting) while letting a reader skip to what matters. */
+details {{ margin-top: 0.3rem; }}
+details > summary {{ cursor: pointer; color: #1a3a5c; font-weight: bold; font-size: 0.9rem;
+  padding: 0.2rem 0; }}
+details > summary:hover {{ text-decoration: underline; }}
+thead th {{ position: sticky; top: 0; z-index: 1; }}
+
+@media print {{
+  /* A printed/PDF copy must show everything, collapsed or not. */
+  details > div, details > ul, details > table {{ display: block !important; }}
+  details[open] > summary::marker, details > summary::marker {{ content: ""; }}
+  body {{ padding: 0.5rem; }}
+  .section {{ box-shadow: none; border: 1px solid #dee2e6; page-break-inside: avoid; }}
+}}
 </style>
 </head>
 <body>
@@ -157,22 +292,23 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
 <p class="subtitle">AI Agent Boundary Auditor</p>
 
 <div class="section meta"><h2>&#128203; Session Metadata</h2>
-<table>
-<tr><td class="label">Session</td><td>{html.escape(session_id)}</td></tr>
-<tr><td class="label">Target Agent</td><td>{html.escape(target_comm or "(all)")}</td></tr>
-<tr><td class="label">Project Path</td><td>{html.escape(project_path)}</td></tr>
-<tr><td class="label">Total Events</td><td>{safety["total_events"]}</td></tr>
-<tr><td class="label">Alerts</td><td>{safety["alert_count"]}</td></tr>
-<tr><td class="label">Commands Executed</td><td>{len(summary["commands_executed"])}</td></tr>
-<tr><td class="label">Files Accessed</td><td>{len(summary["files_accessed"])}</td></tr>
-<tr><td class="label">Deleted</td><td>{len(summary["files_deleted"])}</td></tr>
-<tr><td class="label">Renamed</td><td>{len(summary["files_renamed"])}</td></tr>
-<tr><td class="label">Permission Changes</td><td>{len(summary["permission_changes"])}</td></tr>
-<tr><td class="label">Process Exits</td><td>{len(summary["process_exits"])}</td></tr>
-</table>
+<div class="metagrid">
+<div><span class="label">Session</span>{html.escape(session_id)}</div>
+<div><span class="label">Target Agent</span>{html.escape(target_comm or "(all)")}</div>
+<div><span class="label">Project Path</span>{html.escape(project_path)}</div>
+<div><span class="label">Total Events</span>{safety["total_events"]:,}</div>
+<div><span class="label">Alerts</span>{safety["alert_count"]:,}</div>
+<div><span class="label">Commands</span>{len(summary["commands_executed"]):,}</div>
+<div><span class="label">Files Accessed</span>{len(summary["files_accessed"]):,}</div>
+<div><span class="label">Deleted</span>{len(summary["files_deleted"]):,}</div>
+<div><span class="label">Renamed</span>{len(summary["files_renamed"]):,}</div>
+<div><span class="label">Permission Changes</span>{len(summary["permission_changes"]):,}</div>
+<div><span class="label">Process Exits</span>{len(summary["process_exits"]):,}</div>
+</div>
 </div>
 
 <div class="safety-badge">Commit Safety: {html.escape(safety["safety"])}</div>
+{_summary_html(safety, events)}
 """
 
     # Normal activity
@@ -181,42 +317,46 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     normal_files = [e.get("path","") for e in events if e.get("event")=="openat" and not e.get("alert")]
     # Aggregate repeated entries into one row + a ×N count, THEN cap at 20 unique
     # rows (so repeated early activity doesn't hide later distinct activity).
+    # Routine toolchain activity is the bulkiest, least surprising block, so it
+    # is collapsed by default and the reader opens it only when curious.
     if normal_cmds:
-        h += "<ul>\n"
+        body = "<ul>\n"
         for c, n in aggregate_for_display(normal_cmds, lambda s: s)[:20]:
-            h += f"  <li><code>{html.escape(c)}</code>{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+            body += f"  <li><code>{html.escape(c)}</code>{_count_suffix(n)}</li>\n"
+        body += "</ul>\n"
+        h += _details("Commands", body, count=len(normal_cmds))
     if normal_files:
-        h += "<p><b>Files:</b></p><ul>\n"
+        body = "<ul>\n"
         for f, n in aggregate_for_display(normal_files, lambda s: s)[:20]:
-            h += f"  <li>{html.escape(f)}{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+            body += f"  <li>{html.escape(f)}{_count_suffix(n)}</li>\n"
+        body += "</ul>\n"
+        h += _details("Files", body, count=len(normal_files))
     # File-mutation evidence that did not raise an alert (renames, safe chmods,
     # exits, and any non-alerting deletion) — event-aware so nothing is blank.
     normal_renames = [e for e in events if e.get("event") == "renameat2" and not e.get("alert")]
     normal_chmods  = [e for e in events if e.get("event") == "fchmodat" and not e.get("alert")]
     normal_deletes = [e for e in events if e.get("event") == "unlinkat" and not e.get("alert")]
     exits          = [e for e in events if e.get("event") == "exit_group"]
+    def _evidence_block(label, rows, collapse):
+        body = "<ul>\n"
+        for e, n in aggregate_for_display(rows, format_event_detail)[:20]:
+            body += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
+        body += "</ul>\n"
+        if collapse:
+            return _details(label, body, count=len(rows))
+        return f"<p><b>{html.escape(label)}:</b></p>" + body
+
+    # Deletions, renames and permission changes are the parts of this section a
+    # reviewer actually looks at, so they stay open; process exits are lifecycle
+    # bookkeeping and are the bulkiest, so they collapse.
     if normal_deletes:
-        h += "<p><b>Deletions:</b></p><ul>\n"
-        for e, n in aggregate_for_display(normal_deletes, format_event_detail)[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+        h += _evidence_block("Deletions", normal_deletes, collapse=False)
     if normal_renames:
-        h += "<p><b>Renames:</b></p><ul>\n"
-        for e, n in aggregate_for_display(normal_renames, format_event_detail)[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+        h += _evidence_block("Renames", normal_renames, collapse=False)
     if normal_chmods:
-        h += "<p><b>Permission changes:</b></p><ul>\n"
-        for e, n in aggregate_for_display(normal_chmods, format_event_detail)[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+        h += _evidence_block("Permission changes", normal_chmods, collapse=False)
     if exits:
-        h += "<p><b>Process exits:</b></p><ul>\n"
-        for e, n in aggregate_for_display(exits, format_event_detail)[:20]:
-            h += f"  <li>{html.escape(format_event_detail(e))}{_count_suffix(n)}</li>\n"
-        h += "</ul>\n"
+        h += _evidence_block("Process exits", exits, collapse=True)
     if not (normal_cmds or normal_files or normal_renames
             or normal_chmods or normal_deletes or exits):
         h += "<p>No normal activity recorded.</p>\n"
@@ -329,21 +469,55 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
         def _alert_key(a):
             return (a.get("severity", ""), a.get("rule_id", ""), a.get("pid", ""),
                     a.get("comm", ""), format_event_detail(a), a.get("reason", ""))
-        h += "<table>\n"
-        h += ("<tr><th>Severity</th><th>Rule</th><th>PID</th><th>Comm</th>"
-              "<th>Path/Argv</th><th>Reason</th><th>Occurrences</th></tr>\n")
-        for a, n in aggregate_for_display(alerts, _alert_key):
-            sev = a.get("severity", "")
-            sc = SEV_COLORS.get(sev, "#666")
-            occ = f"&times;{n}" if n > 1 else "&mdash;"
-            h += (f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
-                  f"<td>{html.escape(a.get('rule_id',''))}</td>"
-                  f"<td>{html.escape(str(a.get('pid','')))}</td>"
-                  f"<td>{html.escape(a.get('comm',''))}</td>"
-                  f"<td>{html.escape(format_event_detail(a))}</td>"
-                  f"<td>{html.escape(a.get('reason',''))}</td>"
-                  f"<td>{occ}</td></tr>\n")
-        h += "</table>\n"
+        def _alert_table(rows):
+            # No Reason column: it restates rule + target + pid/comm, which are
+            # already their own columns, and the extra width squeezed the path.
+            out = ["<table>",
+                   "<thead><tr><th>Severity</th><th>Rule</th><th>PID</th>"
+                   "<th>Comm</th><th>Target &amp; reason</th><th>Count</th></tr></thead><tbody>"]
+            for a, n in aggregate_for_display(rows, _alert_key):
+                sev = a.get("severity", "")
+                sc = SEV_COLORS.get(sev, "#666")
+                occ = f"&times;{n}" if n > 1 else "&mdash;"
+                # The reason moves under the target instead of into its own
+                # column: it repeats rule/pid/comm, and as a 7th column it
+                # squeezed the path it was explaining. It still carries detail
+                # the other cells lack (octal modes, sequence wording), so it is
+                # kept as a muted second line.
+                detail = html.escape(format_event_detail(a))
+                reason = html.escape(a.get("reason", ""))
+                cell = detail or "&mdash;"
+                if reason and reason != detail:
+                    cell += f'<br><span class="reason">{reason}</span>'
+                out.append(
+                    f"<tr><td><span class='sev' style='background:{sc}'>{html.escape(sev)}</span></td>"
+                    f"<td>{html.escape(a.get('rule_id',''))}</td>"
+                    f"<td>{html.escape(str(a.get('pid','')))}</td>"
+                    f"<td>{html.escape(a.get('comm',''))}</td>"
+                    f"<td>{cell}</td>"
+                    f"<td>{occ}</td></tr>")
+            out.append("</tbody></table>")
+            return "\n".join(out) + "\n"
+
+        # Network observation is evidence, not a violation (README section 7):
+        # a single agent run emits dozens of connects, which visually swamped the
+        # findings that actually drive the verdict. Split it out and collapse it.
+        # A CRITICAL outbound alert would set the verdict to UNSAFE, so it must
+        # not be filed as "evidence only" — only routine, non-critical network
+        # observation is split out.
+        network = [a for a in alerts if a.get("rule_id") == "outbound-connect"
+                   and a.get("severity") != "critical"]
+        findings = [a for a in alerts if a not in network]
+        if findings:
+            h += _alert_table(findings)
+        elif not network:
+            h += '<p class="empty">No alerts or findings.</p>\n'
+        if network:
+            if not findings:
+                h += ('<p class="empty">No rule findings. The connections below are '
+                      'recorded as evidence and do not affect the verdict.</p>\n')
+            h += _details("Outbound connections (evidence only)",
+                          _alert_table(network), count=len(network))
     if safety.get("suspicious_sequences"):
         h += '<h3>&#128680; Suspicious Sequences</h3><ul>\n'
         for f in safety["suspicious_sequences"]:
@@ -381,13 +555,16 @@ pre {{ background: #f1f3f5; padding: 0.8rem; border-radius: 6px; font-size: 0.82
     if recent:
         h += (f'<p>Showing the most recent {len(recent)} of {len(events)} '
               f'event(s), newest first.</p>\n')
-        h += "<table>\n<tr><th>Event</th><th>PID</th><th>Comm</th><th>Detail</th></tr>\n"
+        body = ("<table>\n<thead><tr><th>Event</th><th>PID</th><th>Comm</th>"
+                "<th>Detail</th></tr></thead><tbody>\n")
         for e in recent:
-            h += (f"<tr><td>{html.escape(e.get('event',''))}</td>"
-                  f"<td>{html.escape(str(e.get('pid','')))}</td>"
-                  f"<td>{html.escape(e.get('comm',''))}</td>"
-                  f"<td>{html.escape(format_event_detail(e))}</td></tr>\n")
-        h += "</table>\n"
+            body += (f"<tr><td>{html.escape(e.get('event',''))}</td>"
+                     f"<td>{html.escape(str(e.get('pid','')))}</td>"
+                     f"<td>{html.escape(e.get('comm',''))}</td>"
+                     f"<td>{html.escape(format_event_detail(e))}</td></tr>\n")
+        body += "</tbody></table>\n"
+        # A raw tail is reference material, not a finding: collapsed by default.
+        h += _details("Event log", body, count=len(recent))
     else:
         h += '<p class="empty">No events recorded.</p>\n'
     h += "</div>\n"
