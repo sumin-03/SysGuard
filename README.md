@@ -206,6 +206,10 @@ sudo ./build/sysguard --agent-mode --target-comm claude \
 
 > **잔여 위험(문서화).** 검증은 시작 시 1회 수행하므로, 모니터링 대상 사용자가 이후 디렉터리를 바꿔치기하는 TOCTOU 창이 남는다. C 엔진은 실시간 hot path라 매 이벤트를 재확인할 수 없지만, 판정을 소유한 Python 계층은 후보 경로를 매번 resolve해서 자기 자신으로 풀리지 않으면 면제를 거부한다. 근본 해결은 `TASK-A-014`(collector가 이벤트 시점 resolve된 경로 기록)와 같다.
 
+**알려진 한계 — agent 설정 원자적 교체(`TASK-B-022`).** Claude Code는 자기 설정(`~/.claude.json`, `~/.claude/settings*.json`)을 `<파일>.tmp.<pid>.<hex>` 에 쓴 뒤 rename 하는 방식으로만 갱신하며, 아무 작업도 하지 않은 세션에서도 여러 번 발생한다(실측: staging+rename 4회, 직접 쓰기 0회). rename 수집(`TASK-A-015`)이 들어오자 **모든 정상 세션이 `UNSAFE`** 가 되어, 이 형태를 **정보성으로 분류**하기로 결정했다.
+
+이 결정의 대가는 명확하다: **프롬프트 인젝션을 당한 agent(또는 `comm` 을 공유하는 자식)가 임의의 hook·MCP 설정을 staging 파일에 쓰고 rename 하면, 정상 갱신과 syscall 수준에서 완전히 동일하다.** staging 이름·pid·내용 어느 것도 의도를 구분해주지 못하므로 **이 경로의 설정 백도어는 탐지되지 않는다.** 좁히기로 얻은 것은 (a) 파일 소유 agent만 이 규칙을 쓸 수 있고 (b) staging 이름이 해당 목적지의 것이어야 하며 (c) `RENAME_EXCHANGE` 는 제외된다는 점 — 즉 *다른* 프로세스가 면제를 빌려 쓰지는 못한다. 설정 파일에 **직접 쓰기**는 여전히 `UNSAFE` 다. 남은 구멍을 닫으려면 경로 규칙이 아니라 **설정 내용의 전후 해시**가 필요하다.
+
 **알려진 한계(문서화된 trade-off).** `~/.claude/session-env/`·`~/.claude/shell-snapshots/`(둘 다 이후 셸에서 source되는 스크립트)와 `~/.claude/plugins/cache/`(실행 가능한 plugin 콘텐츠)는 경로만으로 면제한다. 일상 세션의 가독성을 위해 채택한 선택이며, 추적 중인 악성 자식 프로세스가 그 위치에 쓰는 경우를 놓칠 수 있는 **cache-poisoning / session-script false-negative**를 감수한다. 더 엄격한 프로파일은 "이번 실행에 새로 생성된 session runtime root"와 무결성 검증을 요구해야 한다. 면제된 쓰기도 리포트에는 건수와 대표 경로가 항상 남는다.
 
 ### 7. Commit Safety 평가

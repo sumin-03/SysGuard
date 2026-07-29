@@ -219,10 +219,48 @@ int main(void)
 
     /* Atomic replace: rename ONTO a persistence target is critical, and the
      * destination — not the exempt staging source — decides. */
-    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    e = mk_rename(HOME "/.bashrc.staged", HOME "/.bashrc");
     CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
     e = mk_rename(HOME "/.claude/projects/a", HOME "/.claude/projects/b");
     CHECK(rule_of(&e, P) == NULL);
+
+    /* ...but the agent replacing its OWN config through its OWN staging file is
+     * how Claude Code always writes these, so it is not an alert. */
+    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    CHECK(rule_of(&e, P) == NULL);
+    e = mk_rename(HOME "/.claude/settings.json.tmp.42.beef", HOME "/.claude/settings.json");
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* Only the owning agent may use this rule: another monitored agent staging
+     * the same name and renaming it into place is tampering, not bookkeeping. */
+    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    strncpy(e.comm, "codex", sizeof(e.comm) - 1);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    strncpy(e.comm, "Bun Pool 3", sizeof(e.comm) - 1);   /* Claude's worker threads */
+    CHECK(rule_of(&e, P) == NULL);
+
+    /* RENAME_EXCHANGE swaps rather than replaces, so it is not the exempted
+     * atomic-replace pattern. */
+    e = mk_rename(HOME "/.claude.json.tmp.426628.ab", HOME "/.claude.json");
+    e.flags = (1 << 1);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+
+    /* The staging name must belong to the destination, and be well formed, or an
+     * arbitrary file could be renamed into place unnoticed. */
+    e = mk_rename(HOME "/evil", HOME "/.claude.json");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/.claude.json.tmp.notapid.zz", HOME "/.claude.json");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_rename(HOME "/.bashrc.tmp.42.ab", HOME "/.bashrc");
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+
+    /* A DIRECT mutating open of the config is still persistence: that is the
+     * attack shape, and it never occurs in a normal session. */
+    e = mk_open(HOME "/.claude.json", O_WRONLY | O_TRUNC);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
+    e = mk_open(HOME "/.claude/settings.json", O_WRONLY);
+    CHECK(is(rule_of(&e, P), "persistence-sensitive-write"));
 
     /* A rename onto a PROTECTED destination keeps protected precedence, so a
      * file staged in an exempt runtime dir cannot replace credentials silently. */

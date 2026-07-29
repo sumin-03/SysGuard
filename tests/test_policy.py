@@ -479,9 +479,11 @@ class B012EffectAwareWriteTests(unittest.TestCase):
 
     # --- atomic replace -----------------------------------------------------
     def test_rename_onto_persistence_target_is_unsafe(self):
+        # A staged file renamed onto a persistence target that is NOT the agent's
+        # own config still escalates.
         ev = make_event("renameat2", path="", project_path="/project", comm="claude",
-                        old_path="/home/u/.claude.json.tmp.42.ab",
-                        new_path="/home/u/.claude.json")
+                        old_path="/home/u/.bashrc.staged",
+                        new_path="/home/u/.bashrc")
         r = self._verdict([ev])
         self.assertEqual(r["safety"], "UNSAFE")
         self.assertEqual(len(r["persistence_writes"]), 1)
@@ -865,3 +867,86 @@ class B015ToolTmpTests(unittest.TestCase):
                 self.assertEqual(self._verdict([ev])["safety"], "SAFE")
         ev = dict(base, alert=True, severity="critical", rule_id="x")
         self.assertEqual(self._verdict([ev])["safety"], "UNSAFE")
+
+
+class B022AgentConfigRestageTests(unittest.TestCase):
+    """TASK-B-022: Claude Code rewrites its own config through an atomic staging
+    file several times per session — measured on a session that did nothing but
+    read a file: four staging+rename pairs, zero direct writes. That exact shape
+    is informational; anything else about these files still escalates.
+    """
+
+    HOME = "/home/u"
+    UID = 4242
+
+    def _rename(self, old, new):
+        return make_event("renameat2", path="", project_path="/project",
+                          comm="claude", uid=self.UID, old_path=old, new_path=new)
+
+    def _open(self, path, flags):
+        return make_event("openat", path=path, project_path="/project",
+                          comm="claude", uid=self.UID, flags=flags)
+
+    def _verdict(self, events):
+        return policy.evaluate_commit_safety(events, "/project", home_path=self.HOME)
+
+    def test_self_restage_is_informational(self):
+        for cfg, stage in [
+            ("/home/u/.claude.json", "/home/u/.claude.json.tmp.727731.2ab5a0f5"),
+            ("/home/u/.claude/settings.json", "/home/u/.claude/settings.json.tmp.42.beef"),
+            ("/home/u/.claude/settings.local.json",
+             "/home/u/.claude/settings.local.json.tmp.7.aa"),
+        ]:
+            with self.subTest(cfg=cfg):
+                r = self._verdict([self._rename(stage, cfg)])
+                self.assertEqual(r["safety"], "SAFE")
+                self.assertEqual(len(r["agent_config_changes"]), 1)
+                self.assertEqual(r["persistence_writes"], [])
+
+    def test_staging_name_must_belong_to_the_destination(self):
+        # Otherwise any file could be renamed into place unnoticed.
+        for old in ["/home/u/evil",
+                    "/home/u/.claude.json.tmp.notapid.zz",
+                    "/home/u/.claude/settings.json.tmp.42.beef"]:
+            with self.subTest(old=old):
+                r = self._verdict([self._rename(old, "/home/u/.claude.json")])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["persistence_writes"]), 1)
+
+    def test_the_rule_does_not_extend_to_other_persistence_targets(self):
+        r = self._verdict([self._rename("/home/u/.bashrc.tmp.42.ab", "/home/u/.bashrc")])
+        self.assertEqual(r["safety"], "UNSAFE")
+
+    def test_only_the_owning_agent_may_restage_the_config(self):
+        stage, cfg = "/home/u/.claude.json.tmp.42.ab", "/home/u/.claude.json"
+        for comm, expect_safe in [("claude", True), ("Bun Pool 3", True),
+                                  ("MainThread", True), ("codex", False),
+                                  ("gemini", False), ("bash", False)]:
+            with self.subTest(comm=comm):
+                ev = self._rename(stage, cfg)
+                ev["comm"] = comm
+                r = self._verdict([ev])
+                self.assertEqual(r["safety"], "SAFE" if expect_safe else "UNSAFE")
+
+    def test_exchange_does_not_qualify_as_a_routine_restage(self):
+        # RENAME_EXCHANGE swaps the two files instead of replacing one, so it is
+        # not the atomic-replace pattern being exempted.
+        ev = self._rename("/home/u/.claude.json.tmp.42.ab", "/home/u/.claude.json")
+        ev["flags"] = policy.RENAME_EXCHANGE
+        r = self._verdict([ev])
+        self.assertEqual(r["safety"], "UNSAFE")
+        self.assertEqual(len(r["persistence_writes"]), 1)
+        self.assertEqual(r["agent_config_changes"], [])
+
+    def test_direct_write_to_agent_config_still_escalates(self):
+        # The attack shape. It does not occur in a normal session.
+        for flags in (os.O_WRONLY, os.O_WRONLY | os.O_TRUNC, os.O_RDWR):
+            with self.subTest(flags=flags):
+                r = self._verdict([self._open("/home/u/.claude.json", flags)])
+                self.assertEqual(r["safety"], "UNSAFE")
+                self.assertEqual(len(r["persistence_writes"]), 1)
+
+    def test_reading_agent_config_stays_silent(self):
+        r = self._verdict([self._open("/home/u/.claude.json", os.O_RDONLY)])
+        self.assertEqual(r["safety"], "SAFE")
+        self.assertEqual(r["agent_config_changes"], [])

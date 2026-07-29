@@ -651,3 +651,25 @@ class B021ContrastTests(unittest.TestCase):
         for sev, color in report.SEV_COLORS.items():
             with self.subTest(severity=sev):
                 self.assertGreaterEqual(self._ratio("#ffffff", color), 4.5)
+
+
+class B022ConfigReportTests(unittest.TestCase):
+    """TASK-B-022: agent-config rewrites are informational, but the report must
+    not claim they avoided persistence-sensitive paths — they *are* those paths."""
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def test_config_rewrites_get_their_own_honest_block(self, _git):
+        import pwd
+        uid = os.getuid()
+        home = pwd.getpwuid(uid).pw_dir.rstrip("/")
+        ev = make_event("renameat2", path="", project_path="/project", comm="claude",
+                        uid=uid, old_path=f"{home}/.claude.json.tmp.42.ab",
+                        new_path=f"{home}/.claude.json")
+        with tempfile.TemporaryDirectory() as d:
+            rendered = read_text(report.generate_report(
+                write_jsonl(d, [ev]), project_path="/project"))
+        self.assertIn("Agent config rewrites", rendered)
+        self.assertIn("can activate hooks and MCP servers", rendered)
+        # It must not be lumped in with the "did not target persistence" note.
+        block = rendered[rendered.index("Agent config rewrites"):]
+        self.assertNotIn("did not target protected", block.split("</ul>")[0])

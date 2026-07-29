@@ -365,6 +365,63 @@ static int path_is_runtime_noise_deletion(const char *path,
                          ARRAY_LEN(runtime_noise_deletion_home_prefixes));
 }
 
+/* The agent's own config files. A mutation is activation-bearing, so they are in
+ * the persistence set — but the routine way they change is an atomic replace, and
+ * measurement shows that is the ONLY way Claude Code writes them (a real session
+ * had four staging+rename pairs and zero direct writes). Recognising that exact
+ * shape keeps ordinary sessions quiet without hiding the attack shape: a direct
+ * mutating open, or a rename from something other than this file's own staging
+ * name, still fires. Mirrors AGENT_CONFIG_HOME_PATHS in app/policy.py. */
+static const char *agent_config_home_paths[] = {
+    ".claude.json", ".claude/settings.json", ".claude/settings.local.json",
+};
+
+static int path_is_agent_config(const char *path, const struct sysguard_rule_ctx *ctx) {
+    const char *rel = home_relative(path, ctx);
+    return rel && str_in(rel, agent_config_home_paths, ARRAY_LEN(agent_config_home_paths));
+}
+
+/* True when `old_path` is exactly `new_path` + ".tmp.<pid>.<hex>", i.e. the
+ * destination's own staging file. Requiring the stem to match the destination
+ * means an arbitrary file cannot be renamed into place under this rule. */
+/* Only the agent that OWNS these files may rewrite them under this rule. They
+ * are Claude Code's config, so a different monitored agent (codex, gemini, ...)
+ * staging a file with the same name and renaming it into place is not routine
+ * bookkeeping — it is exactly the tampering shape the persistence rule exists
+ * for. Matched on comm, which is weak evidence on its own, but here it only ever
+ * NARROWS an exemption: failing the check keeps the finding. */
+static int comm_owns_claude_config(const char *comm) {
+    if (!comm || !comm[0]) return 0;
+    return strncmp(comm, "claude", 6) == 0 || strncmp(comm, "Bun Pool", 8) == 0 ||
+           strcmp(comm, "MainThread") == 0;
+}
+
+static int is_agent_config_restage(const char *old_path, const char *new_path,
+                                   const char *comm,
+                                   const struct sysguard_rule_ctx *ctx) {
+    if (!comm_owns_claude_config(comm)) return 0;
+    if (!old_path || !new_path || !path_is_agent_config(new_path, ctx)) return 0;
+    if (path_has_dot_segment(old_path) || path_has_dot_segment(new_path)) return 0;
+    size_t nlen = strlen(new_path);
+    if (strncmp(old_path, new_path, nlen) != 0) return 0;
+    const char *suffix = old_path + nlen;
+    static const char *pfx = ".tmp.";
+    size_t plen = strlen(pfx);
+    if (strncmp(suffix, pfx, plen) != 0) return 0;
+    const char *p = suffix + plen;
+    if (!(*p >= '0' && *p <= '9')) return 0;              /* pid: 1+ digits */
+    while (*p >= '0' && *p <= '9') p++;
+    if (*p != '.') return 0;
+    p++;
+    if (!*p) return 0;                                     /* hex: 1+ digits */
+    for (; *p; p++) {
+        int hex = (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+                  (*p >= 'A' && *p <= 'F');
+        if (!hex) return 0;
+    }
+    return 1;
+}
+
 /* Mutation of these is a persistence/activation risk -> critical. */
 static int path_is_persistence_sensitive(const char *path, const struct sysguard_rule_ctx *ctx) {
     if (!path || !path[0]) return 0;
@@ -641,6 +698,15 @@ int rules_evaluate(const struct sysguard_event *ev,
                 return 1;
             }
         }
+        /* The agent replacing its own config through its own staging file is
+         * routine; it is recorded as an ordinary event, not an alert. Only a
+         * plain rename qualifies: RENAME_EXCHANGE swaps the two files rather
+         * than replacing one, so it is not the atomic-replace pattern being
+         * exempted and must stay subject to the persistence check. */
+        if (!(ev->flags & RENAME_EXCHANGE) &&
+            is_agent_config_restage(ev->old_path, ev->new_path, ev->comm, ctx))
+            return 0;
+
         for (int t = 0; t < n_targets; t++) {
             if (path_is_persistence_sensitive(targets[t], ctx)) {
                 char reason[256];

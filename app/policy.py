@@ -361,6 +361,78 @@ def is_runtime_noise_deletion(path: str, home_path, uid=None, tool_tmp=None) -> 
     return any(rel.startswith(p) for p in RUNTIME_NOISE_DELETION_HOME_PREFIXES)
 
 
+# The agent's own config files. A MUTATION of these is activation-bearing (they
+# can define hooks and MCP servers), so they sit in the persistence set — but the
+# routine way they change is an atomic replace, which measurement shows is the
+# ONLY way Claude Code writes them: across a real session that did nothing but
+# read a file there were four staging+rename pairs and zero direct writes, which
+# made every ordinary session UNSAFE once rename collection landed (TASK-A-015).
+#
+# ACCEPTED FALSE NEGATIVE (project decision, TASK-B-022). Treating that shape as
+# informational cannot be made safe, and the narrowing below does not pretend
+# otherwise:
+#
+#   A prompt-injected Claude — or any descendant, which shares its `comm` — can
+#   write arbitrary hook/MCP configuration into `<config>.tmp.<pid>.<hex>` and
+#   rename it onto the live config. That is byte-for-byte the same syscall
+#   sequence as the benign rewrite. Nothing observable at syscall-entry
+#   distinguishes them: not the staging name, not the pid, not the contents.
+#   Agent config backdoors installed this way are therefore NOT detected.
+#
+# What the narrowing does buy: only the owning agent may use the rule, the
+# staging name must belong to its own destination, and RENAME_EXCHANGE is
+# excluded — so a *different* monitored process cannot borrow the exemption. The
+# direct-write shape still escalates. Closing the remaining gap needs content
+# evidence (pre/post hashes of the config), not a path rule.
+AGENT_CONFIG_HOME_PATHS = (
+    ".claude.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+# "<config>.tmp.<pid>.<hex>" — the staging name must belong to the destination it
+# replaces, so an arbitrary file cannot be renamed into place under this rule.
+_STAGING_SUFFIX_RE = re.compile(r"\.tmp\.[0-9]+\.[0-9A-Fa-f]+\Z")
+
+
+def is_agent_config(path: str, home_path) -> bool:
+    rel = _home_rel(path, home_path)
+    return rel in AGENT_CONFIG_HOME_PATHS if rel else False
+
+
+# Only the agent that OWNS these files may rewrite them under this rule. They are
+# Claude Code's config, so a different monitored agent (codex, gemini, ...)
+# staging a file with the same name and renaming it into place is not routine
+# bookkeeping — it is the tampering shape the persistence rule exists for.
+# Matching on comm is weak evidence in general, but here it only ever NARROWS an
+# exemption: failing the check keeps the finding.
+_CLAUDE_COMM_PREFIXES = ("claude", "Bun Pool")
+_CLAUDE_COMM_EXACT = ("MainThread",)
+
+
+def comm_owns_claude_config(comm: str) -> bool:
+    if not comm:
+        return False
+    return (comm in _CLAUDE_COMM_EXACT
+            or any(comm.startswith(p) for p in _CLAUDE_COMM_PREFIXES))
+
+
+def is_agent_config_restage(old_path: str, new_path: str, home_path,
+                            comm: str = "") -> bool:
+    """True when `old_path` is `new_path`'s own atomic staging file.
+
+    This is the agent rewriting its own config, which happens several times in a
+    session that does nothing but read a file. It is reported as informational
+    rather than as a persistence violation — see the note above.
+    """
+    if not comm_owns_claude_config(comm):
+        return False
+    if not old_path or not new_path or not is_agent_config(new_path, home_path):
+        return False
+    if _has_dot_segment(old_path) or _has_dot_segment(new_path):
+        return False
+    return _STAGING_SUFFIX_RE.sub("", old_path) == new_path
+
+
 def is_persistence_sensitive(path: str, home_path) -> bool:
     """True when a MUTATION of this path is a persistence/activation risk
     (shell rc, ssh authorized_keys, cron, systemd units, autostart, git hooks,
@@ -680,6 +752,16 @@ def classify_event(event: dict, home_path=None, tool_tmp=None) -> dict:
                     "severity": "high",
                     "detail": f"Protected path {verb}: {dest}",
                 })
+            elif (not (rflags & RENAME_EXCHANGE)
+                    and is_agent_config_restage(event.get("old_path", ""), dest,
+                                               home_path, event.get("comm", ""))):
+                # The agent rewriting its own config through its own staging
+                # file: routine, and the only way it ever writes these.
+                findings.append({
+                    "type": "agent_config_change",
+                    "severity": "info",
+                    "detail": f"Agent config rewritten in place: {dest}",
+                })
             elif is_persistence_sensitive(dest, home_path):
                 findings.append({
                     "type": "persistence_sensitive_write",
@@ -785,13 +867,27 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
     boundary_violations = []
     runtime_noise_writes = []
     runtime_noise_deletions = []
+    agent_config_changes = []
     dangerous_commands = []
     file_deletions = []
     unsafe_permission_changes = []
     normal_activities = []
 
+    # A recorded `critical` severity escalates on its own (it covers C-engine
+    # rules with no Python counterpart). But when THIS policy has deliberately
+    # classified the same event as informational, the recorded severity must not
+    # override that — otherwise a log written by an older engine keeps forcing
+    # UNSAFE for activity we have since decided is routine.
+    informational_types = {"runtime_noise_write", "runtime_noise_deletion",
+                           "agent_config_change"}
+    critical_alert = False
+
     for ev in events:
         result = classify_event(ev, home_path, tool_tmp)
+        if ev.get("alert") and ev.get("severity") == "critical":
+            kinds = {f["type"] for f in result["findings"]}
+            if not kinds or not kinds <= informational_types:
+                critical_alert = True
         for f in result["findings"]:
             all_findings.append(f)
             if f["type"] == "protected_path_access":
@@ -804,6 +900,8 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
                 runtime_noise_writes.append(f)
             elif f["type"] == "runtime_noise_deletion":
                 runtime_noise_deletions.append(f)
+            elif f["type"] == "agent_config_change":
+                agent_config_changes.append(f)
             elif f["type"] == "dangerous_command":
                 dangerous_commands.append(f)
             elif f["type"] == "file_deletion":
@@ -856,9 +954,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
                 outside_read_paths.append(p)
 
     # Determine safety
-    has_critical = any(
-        ev.get("severity") == "critical" for ev in events if ev.get("alert")
-    )
+    has_critical = critical_alert
     has_env = any(".env" in f["detail"] for f in protected_accesses)
     has_ssh = any(".ssh" in f["detail"] for f in protected_accesses)
     has_shadow = any("/etc/shadow" in f["detail"] for f in protected_accesses)
@@ -942,6 +1038,7 @@ def evaluate_commit_safety(events: list, project_path: str = "", git_summary=Non
         "boundary_violations": boundary_violations,
         "runtime_noise_writes": runtime_noise_writes,
         "runtime_noise_deletions": runtime_noise_deletions,
+        "agent_config_changes": agent_config_changes,
         "monitored_home": home_path,
         "tool_tmp": tool_tmp or "",
         "outside_project_reads": outside_read_count,

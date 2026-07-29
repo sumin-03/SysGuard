@@ -477,6 +477,25 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
             h += f'  <li class="empty">{path_html(f["detail"])}{_count_suffix(n)}</li>\n'
         h += "</ul>\n"
 
+    # Agent-config rewrites get their own block: they DO target
+    # persistence-sensitive files, so filing them under "did not target
+    # protected, persistence-sensitive, or ordinary user paths" would be wrong.
+    # They are informational only because the atomic-replace shape is how the
+    # agent always writes them — the direct-write and foreign-source shapes still
+    # escalate.
+    configs = safety.get("agent_config_changes", [])
+    if configs:
+        h += "<h3>Agent config rewrites &mdash; informational</h3>\n"
+        h += (f'<p class="empty">The agent replaced {len(configs)} of its own '
+              'configuration file(s) through its own atomic staging file. These '
+              'files can activate hooks and MCP servers, so a direct write or a '
+              'rename from any other source is still reported as a persistence '
+              'finding.</p>\n')
+        h += "<ul>\n"
+        for f, n in aggregate_for_display(configs, lambda x: x["detail"])[:20]:
+            h += f'  <li class="empty">{path_html(f["detail"])}{_count_suffix(n)}</li>\n'
+        h += "</ul>\n"
+
     reads = safety.get("outside_project_reads", 0)
     unknown = safety.get("outside_project_unknown_opens", 0)
     read_paths = safety.get("outside_project_read_paths", [])
