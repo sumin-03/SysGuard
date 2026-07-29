@@ -32,17 +32,19 @@ Git이 추적하지 못하는 local security risk가 있었는가?
 
 ### 1. eBPF syscall 수집
 
-다음 7개 syscall tracepoint를 수집한다.
+다음 7종 event를 9개 syscall tracepoint로 수집한다. rename은 세 syscall이 같은 event로 정규화된다.
 
 | Event | Tracepoint | 수집 정보 |
 |---|---|---|
 | Process execution | `sys_enter_execve` | executable path, argv |
 | File open | `sys_enter_openat` | path, flags |
 | File deletion | `sys_enter_unlinkat` | target path |
-| File rename | `sys_enter_renameat2` | old path, new path |
+| File rename | `sys_enter_rename`, `sys_enter_renameat`, `sys_enter_renameat2` | old path, new path, flags |
 | Permission change | `sys_enter_fchmodat` | path, mode |
 | Network connection | `sys_enter_connect` | destination address |
 | Process exit | `sys_enter_exit_group` | process context |
+
+> **rename을 세 개 다 붙이는 이유.** glibc의 `rename()`은 x86_64에서 `sys_rename`(82)을, coreutils `mv`는 `sys_renameat`을 호출한다. `renameat2`만 추적하면 실사용 rename이 거의 잡히지 않는다 — 실측으로 5,143 event 세션에서 rename이 **0건** 기록됐고, 그 결과 §6의 rename 목적지 정책(면제된 위치에 staging 후 `.env`·`~/.claude.json`으로 교체하는 우회 탐지)이 무력화돼 있었다. 세 tracepoint는 동일한 페이로드(source/destination)를 내보내며, flags가 있는 `renameat2`만 `RENAME_EXCHANGE`를 전달한다.
 
 공통으로 다음 정보를 기록한다.
 

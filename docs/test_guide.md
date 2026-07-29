@@ -3,7 +3,7 @@
 SysGuard를 **실제로 돌려서** 확인하는 종합 가이드. 두 단계로 나뉜다.
 
 - **Part A — root 불필요**: fake 모드 + Python 테스트. eBPF/디스플레이 없이 파이프라인·판정·리포트를 검증한다. (개발 환경에서 이미 통과 확인됨)
-- **Part B — 라이브 eBPF (sudo 필요)**: 실제 syscall을 잡아 7개 tracepoint·13개 규칙이 동작하는지 확인한다. 이건 **타깃 VM에서 직접** 해야 한다.
+- **Part B — 라이브 eBPF (sudo 필요)**: 실제 syscall을 잡아 9개 tracepoint(7종 event)·13개 규칙이 동작하는지 확인한다. 이건 **타깃 VM에서 직접** 해야 한다.
 
 경로는 이 저장소 기준이다. 다른 곳이면 `SG=/path/to/SysGuard` 로 바꿔 쓴다.
 
@@ -127,7 +127,7 @@ xdg-open logs/session_live.html
 
 > sudo로 돌린 뒤 파일 소유권이 root면: `sudo chown $USER logs/session_live.*`
 
-### 3.2 규칙별 트리거 표 (7 tracepoint · 13 규칙)
+### 3.2 규칙별 트리거 표 (9 tracepoint / 7종 event · 13 규칙)
 
 터미널 2(감시 대상 셸)에서 실행. 규칙은 **syscall 진입 시점**에 잡히므로 명령이 실패해도(권한 거부 등) "시도"로 기록된다.
 

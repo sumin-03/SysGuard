@@ -199,8 +199,12 @@ int handle_unlinkat(struct trace_event_raw_sys_enter *ctx)
 // unsigned int flags). Note the interleaved dir-fd args: the source path is
 // args[1] and the destination path is args[3] (args[2] is newdfd, NOT a path).
 // old_path and new_path get independent bounded reads into their own buffers.
-SEC("tracepoint/syscalls/sys_enter_renameat2")
-int handle_renameat2(struct trace_event_raw_sys_enter *ctx)
+/* All three rename syscalls carry the same payload — a source and a
+ * destination — and differ only in argument positions and whether flags exist.
+ * glibc's rename() issues sys_rename on x86_64 and coreutils/mv use renameat,
+ * so tracing renameat2 alone misses almost every real rename. */
+static __always_inline int emit_rename(const char *oldname, const char *newname,
+                                       int32_t flags)
 {
     struct sysguard_event *e;
 
@@ -212,19 +216,41 @@ int handle_renameat2(struct trace_event_raw_sys_enter *ctx)
     clear_payload(e);
     e->type = SYSGUARD_EVENT_RENAME;
 
-    const char *oldname = (const char *)ctx->args[1];
-    const char *newname = (const char *)ctx->args[3];
     bpf_probe_read_user_str(&e->old_path, sizeof(e->old_path), oldname);
     bpf_probe_read_user_str(&e->new_path, sizeof(e->new_path), newname);
-    e->flags = (int32_t)ctx->args[4];
+    e->flags = flags;
 
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
-// fchmodat(int dfd, const char *filename, umode_t mode). We record the target
-// path (args[1]) and the requested mode bits (args[2]); rule matching compares
-// permission bits (e.g. world-writable), not any decimal rendering.
+/* rename(const char *oldname, const char *newname) — no flags, so it can never
+ * be a RENAME_EXCHANGE. */
+SEC("tracepoint/syscalls/sys_enter_rename")
+int handle_rename(struct trace_event_raw_sys_enter *ctx)
+{
+    return emit_rename((const char *)ctx->args[0],
+                       (const char *)ctx->args[1], 0);
+}
+
+/* renameat(int olddfd, const char *oldname, int newdfd, const char *newname) */
+SEC("tracepoint/syscalls/sys_enter_renameat")
+int handle_renameat(struct trace_event_raw_sys_enter *ctx)
+{
+    return emit_rename((const char *)ctx->args[1],
+                       (const char *)ctx->args[3], 0);
+}
+
+/* renameat2(int olddfd, const char *oldname, int newdfd, const char *newname,
+ *           unsigned int flags) — flags carry RENAME_EXCHANGE / RENAME_NOREPLACE. */
+SEC("tracepoint/syscalls/sys_enter_renameat2")
+int handle_renameat2(struct trace_event_raw_sys_enter *ctx)
+{
+    return emit_rename((const char *)ctx->args[1],
+                       (const char *)ctx->args[3],
+                       (int32_t)ctx->args[4]);
+}
+
 SEC("tracepoint/syscalls/sys_enter_fchmodat")
 int handle_fchmodat(struct trace_event_raw_sys_enter *ctx)
 {

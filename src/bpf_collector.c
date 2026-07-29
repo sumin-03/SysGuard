@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stddef.h>
+#include <unistd.h>
 
 #include <bpf/libbpf.h>
 
@@ -25,6 +26,27 @@ static int handle_rb_event(void *ctx, void *data, size_t size)
     return 0;
 }
 
+// Not every architecture has every syscall: arm64, for instance, has no legacy
+// `rename` (only renameat/renameat2), so its tracepoint is absent. Auto-attach
+// treats a missing tracepoint as a fatal error, which would stop the WHOLE
+// collector — including the portable handlers — so probe first and skip loading
+// the program when its tracepoint does not exist.
+static int tracepoint_exists(const char *category, const char *name)
+{
+    static const char *roots[] = {
+        "/sys/kernel/tracing/events",
+        "/sys/kernel/debug/tracing/events",
+    };
+    char path[256];
+
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s/%s/id", roots[i], category, name);
+        if (access(path, F_OK) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 int sysguard_bpf_run(sysguard_event_cb cb, void *ctx, volatile sig_atomic_t *stop)
 {
     struct sysguard_bpf *skel = NULL;
@@ -32,10 +54,23 @@ int sysguard_bpf_run(sysguard_event_cb cb, void *ctx, volatile sig_atomic_t *sto
     struct cb_wrap wrap = { cb, ctx };
     int err;
 
-    skel = sysguard_bpf__open_and_load();
+    skel = sysguard_bpf__open();
     if (!skel) {
-        fprintf(stderr, "sysguard: failed to open/load BPF skeleton\n");
+        fprintf(stderr, "sysguard: failed to open BPF skeleton\n");
         return 1;
+    }
+
+    if (!tracepoint_exists("syscalls", "sys_enter_rename")) {
+        fprintf(stderr,
+                "sysguard: sys_enter_rename unavailable on this architecture; "
+                "renames are still covered by renameat/renameat2.\n");
+        bpf_program__set_autoload(skel->progs.handle_rename, false);
+    }
+
+    err = sysguard_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "sysguard: failed to load BPF skeleton: %d\n", err);
+        goto cleanup;
     }
 
     err = sysguard_bpf__attach(skel);
