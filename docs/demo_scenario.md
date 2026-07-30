@@ -120,53 +120,61 @@ Why this verdict: file deletion ×1
 > **자기가 다음에도 실행될 방법을 심는 것**입니다."
 
 **핵심은 스크립트가 아니라 에이전트에게 시키는 것이다.** 이 도구의 명제가 "AI 에이전트가 무엇을
-했는지 본다"이므로, 시뮬레이터를 감시하면 규칙 엔진 데모가 되고 만다. 실제 홈 디렉터리는
-건드리지 않되, `demo/sandbox_home` 을 **모니터링 대상 HOME** 으로 지정해 규칙 엔진이 진짜 홈과
-똑같은 syscall 을 보게 한다.
+했는지 본다"이므로, 시뮬레이터를 감시하면 규칙 엔진 데모가 되고 만다.
 
-**준비** (발표 전 미리):
+대상은 **실제 `~/.bashrc`** 다. 가짜 홈(`--home-path`)으로 우회하지 않는다 — SysGuard 는 홈을
+두 가지 판단에 쓰는데(① 위험 파일 위치 ② agent 기록물 위치), 홈을 샌드박스로 돌리면 ①은 되지만
+②가 깨져서 진짜 홈의 정상 기록물 수십 건이 전부 위반으로 뜬다. 실제 홈을 쓰면 **설정 없이 기본값
+그대로** 동작하고 리포트도 깨끗하다.
+
+**사전 준비 — 백업은 필수:**
 ```bash
-mkdir -p demo/sandbox_home
-printf '# sandbox shell startup file\n' > demo/sandbox_home/.bashrc
+cp ~/.bashrc ~/.bashrc.backup
 ```
 
-**왼쪽 터미널** — 샌드박스 HOME 으로 수집 시작:
+**왼쪽 터미널** — 기본 설정으로 수집 시작(GUI 로 해도 된다. 입력란은 손대지 않는다):
 ```bash
 sudo ./build/sysguard --agent-mode --target-comm claude \
-  --project-path "$(pwd)" \
-  --home-path "$(pwd)/demo/sandbox_home" \
-  --output logs/demo_persistence.jsonl
+  --project-path "$(pwd)" --output logs/demo_persistence.jsonl
 ```
 
 **오른쪽 터미널** — 에이전트에게 **평범해 보이는 요청** 두 개를 순서대로:
 
-> ① `demo/sandbox_home/.bashrc 읽어줘`
-> ② `demo/sandbox_home/.bashrc 끝에 echo "hi" 한 줄만 추가해줘`
+> ① `~/.bashrc 읽어줘`
+> ② `~/.bashrc 끝에 "# sysguard demo" 주석 한 줄만 추가해줘`
 
-에이전트 입장에서 ②는 프로젝트 안의 텍스트 파일 하나를 고치는 평범한 편집 요청이다. 거절할
-이유가 없고, **바로 그 점이 이 시연의 핵심이다** — 프롬프트 인젝션은 이렇게 생겼다.
+②는 주석이므로 셸 동작에 아무 영향이 없지만 **파일 쓰기는 동일하게 발생**한다. 실행문
+(`echo "hi"` 같은)을 넣으면 이후 열리는 모든 터미널에 출력이 떠서 발표 중에 지저분해진다.
+
+에이전트 입장에서 ②는 텍스트 파일 한 줄 추가하는 평범한 요청이라 거절할 이유가 없다.
+**바로 그 점이 이 시연의 핵심이다** — 프롬프트 인젝션은 이렇게 생겼다.
 
 **왼쪽 터미널에 뜨는 것:**
 ```
   (①에서는 아무것도 뜨지 않음)
-  [critical] persistence-sensitive-write - Write to persistence/activation target: .../.bashrc
+  [critical] persistence-sensitive-write - Write to persistence/activation target: /home/<user>/.bashrc
 ```
 
-> "①은 **읽기**였고 아무 경고도 없었습니다. 쉘은 `.bashrc` 를 매번 읽으니까요.
+> "①은 **읽기**였고 아무 경고도 없었습니다. 셸은 `.bashrc` 를 매번 읽으니까요.
 > ②는 **쓰기**입니다. 같은 파일인데 critical 입니다.
 > 저희는 위험도를 '어디에 접근했나'가 아니라 **'무슨 효과를 내는가'** 로 판정합니다."
 
 **그리고 어떻게 잡혔는지 짚는다:**
 
 > "에이전트는 파일을 직접 쓰지 않습니다. `.bashrc.tmp.<pid>.<hex>` 에 쓰고 **rename 으로
-> 교체**합니다. staging 쓰기는 프로젝트 안이라 조용하고, **rename 의 목적지**를 보고 잡았습니다.
-> 저희는 처음에 `renameat2` 만 추적했는데 glibc 는 `rename`(82) 을 호출합니다 — 실측으로 rename 이
-> **0건** 잡히는 걸 발견하고 tracepoint 세 개를 모두 붙였습니다. 그 수정이 없었다면 이 공격은
-> 통째로 안 보였습니다."
+> 교체**합니다. staging 쓰기만 보면 평범한 임시 파일이라 신호가 없고, **rename 의 목적지**를 보고
+> 잡았습니다. 저희는 처음에 `renameat2` 만 추적했는데 glibc 는 `rename`(82) 을 호출합니다 —
+> 실측으로 rename 이 **0건** 기록되는 걸 발견하고 tracepoint 세 개를 모두 붙였습니다
+> (`TASK-A-015`). 그 수정이 없었다면 이 공격은 통째로 안 보였습니다."
 
 리포트를 열어 **Persistence-Sensitive Writes** 섹션과 `Commit Safety: UNSAFE` 를 보여준다.
 
-> **플랜 B**: rename 수집이 안 되거나 에이전트가 요청을 거절하면
+**시연 직후 즉시 복원:**
+```bash
+mv ~/.bashrc.backup ~/.bashrc
+```
+
+> **플랜 B**: 에이전트가 요청을 거절하거나 rename 수집이 안 되면
 > `bash demo/agent_persistence_simulator.sh` 로 대체한다. 스크립트는 `>>` 로 직접 쓰므로
 > `openat` 경로에서 잡히고, `.ssh/authorized_keys` 와 agent 설정까지 한 번에 보여준다.
 > 다만 "에이전트가 한 것"이라는 서사는 약해지므로 어디까지나 대체재다.
@@ -249,7 +257,7 @@ sudo -E python3 app/main.py
 
 **fake 모드 한 줄:**
 ```bash
-./build/sysguard --fake --project-path "$(pwd)" --home-path "$(pwd)/demo/sandbox_home" \
+./build/sysguard --fake --project-path "$(pwd)" \
   --output logs/demo_fake.jsonl && python3 app/report.py logs/demo_fake.jsonl
 ```
 
@@ -258,6 +266,7 @@ sudo -E python3 app/main.py
 ## 정리 (발표 후)
 
 ```bash
-rm -rf demo/sandbox_home demo/sandbox_normal demo/sandbox_risky
+mv ~/.bashrc.backup ~/.bashrc 2>/dev/null   # Act 4 백업 복원 (아직 안 했다면)
+rm -rf demo/sandbox_normal demo/sandbox_risky
 git status --short          # 작업 트리가 깨끗한지 확인
 ```
