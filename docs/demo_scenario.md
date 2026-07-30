@@ -21,7 +21,10 @@ python3 -m unittest discover -s tests -t .   # OK (실패 0건)
   ```bash
   mkdir -p logs/archive && mv logs/session_*.jsonl logs/session_*.html logs/archive/ 2>/dev/null
   ```
-- [ ] **라이브 eBPF 동작 확인** (필수 — 이게 안 되면 Act 2·3을 fake로 대체해야 한다)
+- [ ] **라이브 eBPF 동작 확인** (필수 — 이게 안 되면 Act 2·3을 fake로 대체해야 한다).
+      Act 4는 추가로 **rename 수집**에 의존한다. 세션 로그에서 확인:
+      `python3 -c "import json;print(sum(1 for l in open('logs/<세션>.jsonl') if '\"renameat2\"' in l))"`
+      → 0보다 커야 한다 (2026-07-30 확인: 5,428 이벤트 중 rename 20건)
   ```bash
   sudo ./build/sysguard --fake --project-path "$(pwd)" --output /tmp/preflight.jsonl >/dev/null && echo OK
   sudo ./build/sysguard --target-comm bash --project-path "$(pwd)" --output /tmp/live.jsonl &
@@ -116,42 +119,57 @@ Why this verdict: file deletion ×1
 > "그럼 AI 에이전트한테 **진짜 위험한 공격**은 뭘까요? 프롬프트 인젝션을 당한 에이전트가
 > **자기가 다음에도 실행될 방법을 심는 것**입니다."
 
-**실제 홈 디렉터리는 건드리지 않는다.** 샌드박스 HOME으로 수집:
+**핵심은 스크립트가 아니라 에이전트에게 시키는 것이다.** 이 도구의 명제가 "AI 에이전트가 무엇을
+했는지 본다"이므로, 시뮬레이터를 감시하면 규칙 엔진 데모가 되고 만다. 실제 홈 디렉터리는
+건드리지 않되, `demo/sandbox_home` 을 **모니터링 대상 HOME** 으로 지정해 규칙 엔진이 진짜 홈과
+똑같은 syscall 을 보게 한다.
+
+**준비** (발표 전 미리):
 ```bash
-sudo ./build/sysguard --agent-mode --target-comm bash \
+mkdir -p demo/sandbox_home
+printf '# sandbox shell startup file\n' > demo/sandbox_home/.bashrc
+```
+
+**왼쪽 터미널** — 샌드박스 HOME 으로 수집 시작:
+```bash
+sudo ./build/sysguard --agent-mode --target-comm claude \
   --project-path "$(pwd)" \
   --home-path "$(pwd)/demo/sandbox_home" \
   --output logs/demo_persistence.jsonl
 ```
 
-> `--target-comm bash`는 모든 bash를 대상으로 잡으므로, 시연 중에는 **다른 터미널 작업을 멈춰두는 것**이 깔끔하다.
+**오른쪽 터미널** — 에이전트에게 **평범해 보이는 요청** 두 개를 순서대로:
 
-**오른쪽 터미널:**
-```bash
-bash demo/agent_persistence_simulator.sh
-```
+> ① `demo/sandbox_home/.bashrc 읽어줘`
+> ② `demo/sandbox_home/.bashrc 끝에 echo "hi" 한 줄만 추가해줘`
 
-**왼쪽 터미널에 실시간으로 뜨는 것:**
+에이전트 입장에서 ②는 프로젝트 안의 텍스트 파일 하나를 고치는 평범한 편집 요청이다. 거절할
+이유가 없고, **바로 그 점이 이 시연의 핵심이다** — 프롬프트 인젝션은 이렇게 생겼다.
+
+**왼쪽 터미널에 뜨는 것:**
 ```
+  (①에서는 아무것도 뜨지 않음)
   [critical] persistence-sensitive-write - Write to persistence/activation target: .../.bashrc
-  [critical] persistence-sensitive-write - Write to persistence/activation target: .../.ssh/authorized_keys
-  [critical] persistence-sensitive-write - Write to persistence/activation target: .../.claude/settings.json
 ```
 
-> "세 건 다 CRITICAL입니다. 쉘 시작 파일, SSH 인증키, 그리고 **에이전트 자신의 설정 파일**입니다.
-> 마지막 게 특히 중요합니다 — Claude Code 설정에는 hook을 정의할 수 있어서, 여기 한 줄 심으면
-> **다음 세션부터 임의 명령이 자동 실행**됩니다."
+> "①은 **읽기**였고 아무 경고도 없었습니다. 쉘은 `.bashrc` 를 매번 읽으니까요.
+> ②는 **쓰기**입니다. 같은 파일인데 critical 입니다.
+> 저희는 위험도를 '어디에 접근했나'가 아니라 **'무슨 효과를 내는가'** 로 판정합니다."
 
-**그리고 결정적인 대비를 보여준다:**
+**그리고 어떻게 잡혔는지 짚는다:**
 
-> "여기서 눈여겨보실 건 **1번과 3번이 같은 파일**이라는 겁니다.
-> `.bashrc`를 **읽은** 1번은 아무 경고도 없었습니다. 쉘은 원래 매번 읽으니까요.
-> **쓴** 3번만 CRITICAL입니다.
-> 저희는 위험도를 '어디에 접근했나'가 아니라 **'무슨 효과를 내는가'**로 판정합니다."
+> "에이전트는 파일을 직접 쓰지 않습니다. `.bashrc.tmp.<pid>.<hex>` 에 쓰고 **rename 으로
+> 교체**합니다. staging 쓰기는 프로젝트 안이라 조용하고, **rename 의 목적지**를 보고 잡았습니다.
+> 저희는 처음에 `renameat2` 만 추적했는데 glibc 는 `rename`(82) 을 호출합니다 — 실측으로 rename 이
+> **0건** 잡히는 걸 발견하고 tracepoint 세 개를 모두 붙였습니다. 그 수정이 없었다면 이 공격은
+> 통째로 안 보였습니다."
 
-리포트를 열어 **Persistence-Sensitive Writes** 섹션과 `Commit Safety: UNSAFE`를 보여준다.
+리포트를 열어 **Persistence-Sensitive Writes** 섹션과 `Commit Safety: UNSAFE` 를 보여준다.
 
----
+> **플랜 B**: rename 수집이 안 되거나 에이전트가 요청을 거절하면
+> `bash demo/agent_persistence_simulator.sh` 로 대체한다. 스크립트는 `>>` 로 직접 쓰므로
+> `openat` 경로에서 잡히고, `.ssh/authorized_keys` 와 agent 설정까지 한 번에 보여준다.
+> 다만 "에이전트가 한 것"이라는 서사는 약해지므로 어디까지나 대체재다.
 
 ## Act 5 — 마무리 (1분)
 
@@ -199,6 +217,19 @@ sudo -E python3 app/main.py
 > 실제 세션 로그로 반복 측정했습니다. 초기엔 이벤트의 50%가 경고였고 그중 98%가 읽기였습니다.
 > 읽기/쓰기 구분 → 런타임 bookkeeping 분류 → 효과 기반 재분류를 거쳐,
 > 지금은 순수 읽기 세션이 **위반 0건**으로 나옵니다.
+
+**Q. Act 4에서 에이전트가 `.bashrc` 를 직접 쓴 게 맞나? 조작 아닌가?**
+> 에이전트에게 준 요청은 "이 파일 끝에 한 줄 추가해줘" 뿐입니다. 에이전트 입장에선 프로젝트 안의
+> 텍스트 파일이라 특별할 게 없습니다. SysGuard 쪽에만 `--home-path` 로 그 디렉터리가 감시 대상
+> 사용자의 홈이라고 알려줬고, 규칙 엔진은 **진짜 홈과 똑같은 syscall** 을 봅니다.
+> 발표자의 실제 `~/.bashrc` 는 건드리지 않으면서 판정 경로는 실제와 동일합니다.
+
+**Q. `openat` 만 봐도 되지 않나? 왜 rename 까지 잡나?**
+> 에이전트는 파일을 **직접 쓰지 않습니다.** `<파일>.tmp.<pid>.<hex>` 에 쓰고 rename 으로 교체합니다.
+> staging 쓰기만 보면 프로젝트 안의 평범한 임시 파일이라 아무 신호가 없습니다. **rename 의 목적지**를
+> 봐야 잡힙니다. 저희는 처음에 `renameat2` 만 추적했는데 glibc `rename()` 은 `rename`(82) 을
+> 호출합니다 — 5,143 이벤트 세션에서 rename 이 **0건** 기록되는 걸 보고 발견해서 tracepoint 세 개를
+> 모두 붙였습니다(`TASK-A-015`).
 
 **Q. 현재 한계는?**
 > 세 가지를 문서화해 뒀습니다. ① 심볼릭 링크 우회(A-014) ② `~/.claude/session-env`와 `plugins/cache`를

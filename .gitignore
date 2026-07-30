@@ -15,6 +15,7 @@ __pycache__/
 # Demo simulator sandboxes (runtime artifacts)
 /demo/sandbox_normal/
 /demo/sandbox_risky/
+/demo/sandbox_home/
 
 # Editor / OS noise
 *.o
