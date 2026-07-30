@@ -430,13 +430,16 @@ thead th {{ position: sticky; top: 0; z-index: 1; }}
             return _details(label, body, count=len(rows))
         return f"<p><b>{html.escape(label)}:</b></p>" + body
 
-    # Deletions, renames and permission changes are the parts of this section a
-    # reviewer actually looks at, so they stay open; process exits are lifecycle
-    # bookkeeping and are the bulkiest, so they collapse.
+    # Deletions and permission changes are what a reviewer actually looks at, so
+    # they stay open. Renames and process exits collapse: both are routine and
+    # high-volume — renames became so once the missing rename tracepoints landed
+    # (TASK-A-015), since the agent rewrites its own state files by atomic
+    # replace. A rename that matters is not hidden here anyway: it has its own
+    # finding in the mutations or persistence section.
     if normal_deletes:
         h += _evidence_block("Deletions", normal_deletes, collapse=False)
     if normal_renames:
-        h += _evidence_block("Renames", normal_renames, collapse=False)
+        h += _evidence_block("Renames", normal_renames, collapse=True)
     if normal_chmods:
         h += _evidence_block("Permission changes", normal_chmods, collapse=False)
     if exits:

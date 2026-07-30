@@ -673,3 +673,37 @@ class B022ConfigReportTests(unittest.TestCase):
         # It must not be lumped in with the "did not target persistence" note.
         block = rendered[rendered.index("Agent config rewrites"):]
         self.assertNotIn("did not target protected", block.split("</ul>")[0])
+
+
+class B023CollapsibleRenamesTests(unittest.TestCase):
+    """Renames are routine and high-volume once the rename tracepoints exist
+    (TASK-A-015), so they collapse like commands, files and process exits.
+    Deletions and permission changes stay open — those are what a reviewer looks
+    at."""
+
+    @mock.patch("report.get_git_summary", return_value=fake_git_summary())
+    def _render(self, events, _git=None):
+        with tempfile.TemporaryDirectory() as d:
+            return read_text(report.generate_report(
+                write_jsonl(d, events), project_path="/project"))
+
+    def test_renames_render_collapsed(self):
+        rendered = self._render([
+            make_event("renameat2", old_path="/project/a", new_path="/project/b",
+                       project_path="/project"),
+        ])
+        section = rendered[rendered.index("Normal Development Activity"):
+                           rendered.index("Outside-Project Mutations")]
+        self.assertIn("<summary>Renames", section)
+
+    def test_deletions_and_permission_changes_stay_open(self):
+        rendered = self._render([
+            make_event("unlinkat", path="/project/gone", project_path="/project"),
+            make_event("fchmodat", path="/project/s", mode=0o644, project_path="/project"),
+        ])
+        section = rendered[rendered.index("Normal Development Activity"):
+                           rendered.index("Outside-Project Mutations")]
+        self.assertNotIn("<summary>Deletions", section)
+        self.assertNotIn("<summary>Permission changes", section)
+        self.assertIn("<b>Deletions:</b>", section)
+        self.assertIn("<b>Permission changes:</b>", section)
